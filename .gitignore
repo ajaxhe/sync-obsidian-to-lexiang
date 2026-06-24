@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
+
+# 同步运行时产物（不应提交）
+**/.sync.lock
+**/manifest.json
+**/config.json
+reports/
