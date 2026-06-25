@@ -5,6 +5,9 @@ description: >-
   能够将 Obsidian 中的目录结构和 Markdown 文档（含图片/附件）同步到乐享知识库。
   当用户提到「同步 Obsidian 到乐享」「把笔记同步到知识库」「Obsidian 乐享同步」
   「obsidian sync lexiang」等意图时触发此 skill。
+version: "1.0.0"
+category: productivity
+tags: obsidian, lexiang, sync, markdown, chinese, knowledge-base
 agent_created: true
 ---
 
