@@ -110,7 +110,8 @@ jobs:
           curl -sf -X POST "https://agentskillhub.dev/api/v1/repos/import" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $AGENTSKILLHUB_TOKEN" \
-            -d "{\"url\": \"$REPO_URL\", \"skills\": [\"$SKILL_NAME\"]}"
+            -d "{\"repoFullName\": \"${{ github.repository }}\", \"selectedPaths\": [\".\"]}" \
+            || echo "⚠️ agentskillhub import failed (platform GitHub integration may be down)"
 
   publish-skillshubai:
     needs: load-config
@@ -124,6 +125,57 @@ jobs:
         run: |
           [ -z "$SKILLSHUBAI_TOKEN" ] && echo "⚠️ SKILLSHUBAI_TOKEN not set" && exit 0
           [ "${{ inputs.dry_run }}" = "true" ] && echo "[DRY RUN]" && exit 0
-          npx --yes @skills-hub-ai/cli publish . \
-            --github-repo "https://github.com/${{ github.repository }}" \
-            --tags "${{ needs.load-config.outputs.tags }}"
+          python3 <<'PY'
+          import json, re, os, urllib.request, urllib.error
+          token = os.environ["SKILLSHUBAI_TOKEN"]
+          repo_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}"
+          content = open("SKILL.md").read()
+          fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL)
+          fm, body = fm_match.group(1), content[fm_match.end():]
+
+          def get_field(name, text):
+              m = re.search(rf'^{name}:\s*(.+)$', text, re.MULTILINE)
+              return m.group(1).strip().strip('"') if m else ""
+
+          tags_m = re.search(r'^tags:\s*(.+)$', fm, re.MULTILINE)
+          tags = [t.strip() for t in (tags_m.group(1).split(",") if tags_m else [])]
+          slug = get_field("name", fm)
+          cfg = json.load(open("publish.json")) if os.path.exists("publish.json") else {}
+          version = cfg.get("version") or get_field("version", fm) or "1.0.0"
+
+          payload = {
+              "name": slug,
+              "description": get_field("description", fm)[:500] or slug,
+              "version": version,
+              "categorySlug": get_field("category", fm) or cfg.get("category", "productivity"),
+              "platforms": ["CLAUDE_CODE", "CURSOR", "GEMINI_CLI"],
+              "instructions": body.strip()[:8000],
+              "visibility": "PUBLIC",
+              "tags": tags[:10],
+              "githubRepoUrl": repo_url,
+          }
+
+          def api(method, path, data=None):
+              req = urllib.request.Request(
+                  f"https://api.skills-hub.ai/api/v1/skills{path}",
+                  data=json.dumps(data).encode() if data is not None else None,
+                  headers={"Content-Type": "application/json", "Authorization": f"ApiKey {token}", "User-Agent": "Mozilla/5.0"},
+                  method=method,
+              )
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return resp.status, json.loads(resp.read())
+              except urllib.error.HTTPError as e:
+                  return e.code, json.loads(e.read())
+
+          code, data = api("GET", f"/{slug}")
+          if code == 404:
+              code, data = api("POST", "", payload)
+              if code in (200, 201):
+                  api("POST", f"/{slug}/publish", {})
+          elif code == 200:
+              code, data = api("POST", f"/{slug}/versions", payload)
+              if code in (200, 201):
+                  api("POST", f"/{slug}/publish", {})
+          print(f"skills-hub HTTP {code}: {data.get('status') or data.get('error')}")
+          PY
