@@ -6,6 +6,10 @@ lexiang_api.py - 乐享客户端（连接器模式，零配置零 token）
 脚本直接调用乐享 MCP 端点（https://mcp.lexiang-app.com/mcp），
 鉴权头为 X-Oneid-Access-Token（从本地连接器 token 文件读取）。
 
+降级机制：当 token 文件不可用（过期/不存在）时，自动检测 Agent 本地 MCP
+代理，通过代理调用乐享工具（无需 token）。代理模式从进程列表自动提取
+认证头，兼容 WorkBuddy / QClaw / CodeBuddy。
+
 用户无需安装额外 skill、无需获取任何 app_key/secret —— 只要 Agent 里
 已经授权了乐享连接器，脚本就能直接用。
 
@@ -100,18 +104,107 @@ def discover_token():
     return pool[0][2], pool[0][3]
 
 
+def _is_token_expired(token):
+    """检查 token 是否已过期（JWT exp 字段）。"""
+    exp = _decode_jwt_exp(token)
+    if exp == 0:
+        return False  # 无法解析，假设未过期（让服务端判断）
+    return exp < int(time.time()) + 30
+
+
+def discover_mcp_proxy():
+    """
+    自动检测 Agent 本地 MCP 代理 URL 和认证头（降级方案）。
+    从 WorkBuddy / QClaw / CodeBuddy 进程列表提取。
+
+    返回 (url, auth_headers_dict) 或 (None, None)。
+    auth_headers_dict 包含代理所需的 Authorization 和 X-*-Session-Id 头。
+    """
+    import subprocess, re
+
+    # 环境变量覆盖（仅 URL，不含认证头）
+    env_url = os.environ.get("LEXIANG_MCP_PROXY_URL", "").strip()
+    if env_url:
+        _log(f"   [代理] 使用环境变量 LEXIANG_MCP_PROXY_URL={env_url}")
+        return env_url, {}
+
+    # 从进程列表解析（macOS / Linux 通用）
+    try:
+        out = subprocess.check_output(["ps", "aux"], text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            # 匹配 WorkBuddy / QClaw / CodeBuddy 进程，且包含 mcp-config
+            lower = line.lower()
+            if not ("mcp-config" in lower and
+                    any(k in lower for k in ("workbuddy", "qclaw", "codebuddy"))):
+                continue
+            url_m = re.search(r'"url"\s*:\s*"http://127\.0\.0\.1:\d+/mcp"', line)
+            auth_m = re.search(r'"Authorization"\s*:\s*"([^"]+)"', line)
+            sid_m = re.search(r'"X-WorkBuddy-Session-Id"\s*:\s*"([^"]+)"', line)
+            if url_m and auth_m and sid_m:
+                url = url_m.group(0).split('"')[3]
+                headers = {
+                    "Authorization": auth_m.group(1),
+                    "X-WorkBuddy-Session-Id": sid_m.group(1),
+                }
+                _log(f"   [代理] 从进程列表检测到: {url}")
+                return url, headers
+    except Exception as e:
+        _log(f"   [代理] 进程检测失败: {e}")
+
+    return None, None
+
+
 class LexiangConnector:
-    """通过 WorkBuddy 内置连接器调用乐享 MCP（零配置）"""
+    """通过 WorkBuddy / QClaw 连接器调用乐享 MCP（零配置）
+
+    鉴权优先级：
+      1. 显式传入 token
+      2. 环境变量 LEXIANG_ONEID_TOKEN / 磁盘 token 文件（原逻辑）
+      3. 自动检测 MCP 代理（降级方案，无需 token）
+    """
+
+    # 代理模式下的工具名前缀
+    _PROXY_TOOL_PREFIX = "lexiang_"
 
     def __init__(self, token=None, token_path=None):
         if token:
-            self.token, self.token_path = token, token_path or "(explicit)"
+            # 显式传入 token（最高优先级）
+            self.token = token
+            self.token_path = token_path or "(explicit)"
+            self.use_proxy = False
+            self.mcp_url = MCP_URL
+            self.proxy_headers = {}
         else:
+            # 尝试发现 token（原逻辑，完全不变）
             self.token, self.token_path = discover_token()
-        if not self.token:
-            raise LexiangError(
-                "未发现乐享连接器 token。请确认在 WorkBuddy/QClaw 中已授权乐享连接器。"
-            )
+
+            if self.token and not _is_token_expired(self.token):
+                # Token 有效，使用直连模式
+                self.use_proxy = False
+                self.mcp_url = MCP_URL
+                self.proxy_headers = {}
+            else:
+                # Token 不可用或已过期 → 降级到 MCP 代理
+                if self.token:
+                    _log(f"   [token] token 已过期（来源: {self.token_path}），尝试 MCP 代理模式")
+                else:
+                    _log(f"   [token] 未找到有效 token，尝试 MCP 代理模式")
+
+                proxy_url, proxy_headers = discover_mcp_proxy()
+                if proxy_url:
+                    self.use_proxy = True
+                    self.mcp_url = proxy_url
+                    self.proxy_headers = proxy_headers
+                    self.token = None
+                    self.token_path = f"(proxy: {proxy_url})"
+                    _log(f"   [代理模式] 使用 MCP 代理: {proxy_url}")
+                else:
+                    raise LexiangError(
+                        "未发现有效的乐享连接器 token，且未找到 MCP 代理。\n"
+                        "请确认在 WorkBuddy/QClaw 中已授权乐享连接器，"
+                        "或设置环境变量 LEXIANG_ONEID_TOKEN。"
+                    )
+
         self._session_id = None
         self._initialized = False
 
@@ -123,14 +216,19 @@ class LexiangConnector:
         if not notification:
             body["id"] = str(uuid.uuid4())
         headers = {
-            "X-Oneid-Access-Token": self.token,
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
+        if self.use_proxy:
+            # 代理模式：附加代理认证头
+            headers.update(self.proxy_headers)
+        else:
+            # 直连模式：附加乐享 OAuth token
+            headers["X-Oneid-Access-Token"] = self.token
         if self._session_id:
             headers["Mcp-Session-Id"] = self._session_id
         req = urllib.request.Request(
-            MCP_URL, data=json.dumps(body).encode("utf-8"),
+            self.mcp_url, data=json.dumps(body).encode("utf-8"),
             method="POST", headers=headers,
         )
         try:
@@ -198,7 +296,11 @@ class LexiangConnector:
     def _call_tool_once(self, name, arguments):
         """单次工具调用（_post 已含网络层重试；此处处理业务错误码）。"""
         self._ensure_init()
-        resp = self._post("tools/call", {"name": name, "arguments": arguments})
+        # 代理模式：工具名需要加连接器前缀（entry_create_entry → lexiang_entry_create_entry）
+        actual_name = name
+        if self.use_proxy and not name.startswith(self._PROXY_TOOL_PREFIX):
+            actual_name = self._PROXY_TOOL_PREFIX + name
+        resp = self._post("tools/call", {"name": actual_name, "arguments": arguments})
         if "error" in resp:
             raise LexiangError(f"工具 {name} 调用失败: {resp['error']}")
         result = resp.get("result", {})
@@ -244,6 +346,19 @@ class LexiangConnector:
 
     def whoami(self):
         return self.call_tool("whoami", {})
+
+    def get_space_info(self, space_id):
+        """获取知识库信息，返回 dict（含 root_entry_id 等）。"""
+        data = self.call_tool("space_describe_space", {"space_id": space_id})
+        return data.get("data", {}).get("space", {}) if isinstance(data, dict) else {}
+
+    def resolve_root_entry_id(self, space_id):
+        """获取知识库的 root_entry_id。失败时返回 None。"""
+        try:
+            space = self.get_space_info(space_id)
+            return space.get("root_entry_id") or None
+        except (LexiangError, KeyError, TypeError):
+            return None
 
     def create_folder(self, space_id, name, parent_id=None):
         args = {"entry_type": "folder", "name": name}

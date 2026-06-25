@@ -200,6 +200,19 @@ def do_sync(vault_path, config, mode, source_dirs, dry_run, persist=None, progre
     if not dry_run:
         api = LexiangConnector()
 
+    # target_folder_id 为空时，自动获取知识库根目录的 root_entry_id
+    if not dry_run and not target_folder_id:
+        try:
+            root_id = api.resolve_root_entry_id(space_id)
+            if root_id:
+                target_folder_id = root_id
+                config["target_folder_entry_id"] = target_folder_id
+                log(f"  [配置] 未指定 --target-folder-id，自动获取知识库根目录: {root_id}")
+            else:
+                log(f"  [警告] 无法获取知识库根目录 ID，部分操作可能失败")
+        except LexiangError as e:
+            log(f"  [警告] 获取知识库根目录失败: {e}")
+
     # 关键：即便是 full 模式，也加载已有 manifest 作为「断点续传」基础，
     # 这样中途中断后重跑（无论 full/incremental）都能跳过已完成项。
     manifest = load_manifest(vault_path)
