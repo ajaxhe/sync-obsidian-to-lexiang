@@ -79,10 +79,16 @@ def should_exclude(rel_path, exclude_patterns):
     for pattern in exclude_patterns:
         if fnmatch.fnmatch(rel_path, pattern):
             return True
+        # 对于 "dir/**" 模式，也排除目录本身
+        if pattern.endswith("/**") and fnmatch.fnmatch(rel_path, pattern[:-3]):
+            return True
         parts = rel_path.split(os.sep)
         for i in range(len(parts)):
             partial = os.sep.join(parts[: i + 1])
             if fnmatch.fnmatch(partial, pattern):
+                return True
+            # "dir/**" 也匹配 dir 本身
+            if pattern.endswith("/**") and fnmatch.fnmatch(partial, pattern[:-3]):
                 return True
     return rel_path.startswith(".obsidian")
 
