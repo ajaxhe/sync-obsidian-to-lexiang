@@ -236,6 +236,27 @@ def do_sync(vault_path, config, mode, source_dirs, dry_run, persist=None, progre
             probe_cache[entry_id] = api.probe_entry(entry_id)
         return probe_cache[entry_id]
 
+    # 乐享侧目录子项缓存：{parent_id: {(name, entry_type): entry_dict}}
+    # 用于「manifest 丢失映射」时防重复创建——先查目标目录是否已有同名 entry，命中则复用。
+    lexiang_children_cache = {}
+
+    def find_lexiang_entry(parent_id, match_name, entry_type):
+        """在乐享目标父目录下查找同名同类型 entry，返回 entry dict 或 None。
+        按 parent_id 缓存，同一目录只 list 一次。dry_run 下不查（无网络）。"""
+        if dry_run or not parent_id or not match_name:
+            return None
+        if parent_id not in lexiang_children_cache:
+            try:
+                children = api.list_children(parent_id, limit=200)
+                cache = {}
+                for ch in children:
+                    cache[(ch.get("name", ""), ch.get("entry_type", ""))] = ch
+                lexiang_children_cache[parent_id] = cache
+            except LexiangError as e:
+                log(f"  [查重] 列目录失败，跳过查重: {e}")
+                lexiang_children_cache[parent_id] = {}
+        return lexiang_children_cache[parent_id].get((match_name, entry_type))
+
     def save():
         if persist and not dry_run:
             persist(manifest)
@@ -310,13 +331,33 @@ def do_sync(vault_path, config, mode, source_dirs, dry_run, persist=None, progre
 
         # 新增（manifest 无记录，或类型不匹配）
         if not existing or existing.get("type") != manifest_type:
-            _sync_new(api, space_id, parent_id, name, rel_path, fi, vault_path,
-                      attachment_folder, sync_attachments, report, manifest,
-                      dry_run, save)
-            continue
+            # ⚠️ 防重复创建：manifest 丢失映射时（如断连重建失败冲映射），
+            # 先查乐享目标目录是否已有同名 entry，命中则复用走更新，避免创建重复文档。
+            match_name = name if manifest_type == "page" else os.path.basename(rel_path)
+            found = find_lexiang_entry(parent_id, match_name, manifest_type)
+            if found and found.get("id"):
+                found_id = found["id"]
+                log(f"  [{kind}] {rel_path} manifest 无映射，乐享已有同名 entry，复用 {found_id[:12]}…")
+                set_entry(manifest, rel_path, manifest_type, found_id, "", fi.get("mtime", 0))
+                save()  # 立即落盘，即使后续更新失败也不再重复创建
+                existing = entries.get(rel_path)
+                # 不 continue，继续走下面的 probe → 更新/跳过逻辑
+            else:
+                _sync_new(api, space_id, parent_id, name, rel_path, fi, vault_path,
+                          attachment_folder, sync_attachments, report, manifest,
+                          dry_run, save)
+                continue
 
         entry_id = existing["entry_id"]
-        info = probe(entry_id)
+        try:
+            info = probe(entry_id)
+        except LexiangError as e:
+            # 探活失败（如代理模式返回异常）→ 跳过，不 remove_entry，保留映射待下次重试。
+            # 避免因 probe 抛异常而中断整个同步或冲掉映射导致后续重复创建。
+            report.record_action("update_page", rel_path, "error", entry_id,
+                                 f"探活失败: {e}")
+            log(f"  [{kind}] {rel_path} ⚠ 探活失败，跳过（保留映射）: {e}")
+            continue
 
         # entry 已被删除 → 当作新增重建
         if not info["exists"]:

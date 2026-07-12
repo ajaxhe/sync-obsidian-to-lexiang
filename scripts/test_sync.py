@@ -651,7 +651,8 @@ class TestDoSyncDryRun(unittest.TestCase):
 class FakeConnector:
     """模拟 LexiangConnector，用于测试 do_sync 的非 dry-run 异常处理逻辑（不发网络）"""
 
-    def __init__(self, deleted_ids=None, parent_overrides=None, edited_overrides=None):
+    def __init__(self, deleted_ids=None, parent_overrides=None, edited_overrides=None,
+                 children_map=None):
         self._seq = 0
         self.created_pages = []          # [(name, parent_id)]
         self.created_folders = []        # [(name, parent_id)]
@@ -660,6 +661,8 @@ class FakeConnector:
         self.deleted_ids = set(deleted_ids or [])      # 视为已删除的 entry
         self.parent_overrides = parent_overrides or {}  # {entry_id: actual_parent}
         self.edited_overrides = edited_overrides or {}  # {entry_id: edited_ts}
+        # {parent_id: [entry_dict, ...]}，用于模拟乐享侧已有子项（查重测试）
+        self.children_map = children_map or {}
 
     def _next(self, prefix):
         self._seq += 1
@@ -712,6 +715,10 @@ class FakeConnector:
             "parent_id": self.parent_overrides.get(entry_id, ""),
             "edited_at": self.edited_overrides.get(entry_id, 0),
         }
+
+    def list_children(self, parent_id, limit=100):
+        """返回模拟的乐享侧子项列表（供查重测试）"""
+        return list(self.children_map.get(parent_id, []))
 
 
 class TestDoSyncHardening(unittest.TestCase):
@@ -804,6 +811,62 @@ class TestDoSyncHardening(unittest.TestCase):
             # a.md 重建（1 篇 created），b.md 跳过
             self.assertEqual(report2.stats["pages_created"], 1)
             self.assertEqual(report2.stats["pages_skipped_no_change"], 1)
+        finally:
+            self._unpatch()
+
+    def test_manifest_lost_mapping_dedup(self):
+        """manifest 丢失映射但乐享侧已有同名 entry → 查重复用，不重复创建"""
+        fake = FakeConnector()
+        self._patch_api(fake)
+        try:
+            _, m1 = do_sync(self.tmpdir, self.config, "full", [], False)
+            save_manifest(self.tmpdir, m1)
+            dir1_eid = m1["entries"]["dir1"]["entry_id"]
+            # 模拟 manifest 丢失 a.md 映射（如断连重建失败冲映射）
+            del m1["entries"][os.path.join("dir1", "a.md")]
+            save_manifest(self.tmpdir, m1)
+
+            # 第二次增量：乐享侧 dir1 下已有同名 "a" 的 page
+            fake2 = FakeConnector(children_map={
+                dir1_eid: [{"id": "EXISTING_A", "name": "a", "entry_type": "page"}]
+            })
+            self._unpatch(); self._patch_api(fake2)
+            report2, m2 = do_sync(self.tmpdir, self.config, "incremental", [], False)
+
+            # a.md 复用 EXISTING_A（不创建新），b.md 跳过
+            self.assertEqual(report2.stats["pages_created"], 0)
+            self.assertEqual(len(fake2.created_pages), 0)
+            a_entry = m2["entries"][os.path.join("dir1", "a.md")]
+            self.assertEqual(a_entry["entry_id"], "EXISTING_A")
+        finally:
+            self._unpatch()
+
+    def test_probe_exception_no_wipe(self):
+        """probe 抛异常 → 跳过且保留 manifest 映射，不中断不冲映射"""
+        fake = FakeConnector()
+        self._patch_api(fake)
+        try:
+            _, m1 = do_sync(self.tmpdir, self.config, "full", [], False)
+            save_manifest(self.tmpdir, m1)
+            a_eid = m1["entries"][os.path.join("dir1", "a.md")]["entry_id"]
+
+            # 第二次：probe a 抛异常（模拟代理模式异常）
+            fake2 = FakeConnector()
+            def boom(entry_id):
+                if entry_id == a_eid:
+                    raise LexiangError("MCP 网络错误 tools/call: timeout")
+                return fake2.__class__.probe_entry(fake2, entry_id)
+            fake2.probe_entry = boom
+            self._unpatch(); self._patch_api(fake2)
+            report2, m2 = do_sync(self.tmpdir, self.config, "incremental", [], False)
+
+            # a.md 报错跳过，b.md 正常跳过；不中断整个同步
+            self.assertEqual(report2.stats["errors"], 1)
+            self.assertEqual(report2.stats["pages_created"], 0)
+            # manifest 仍保留 a.md 的映射（未被冲掉）
+            self.assertIn(os.path.join("dir1", "a.md"), m2["entries"])
+            self.assertEqual(
+                m2["entries"][os.path.join("dir1", "a.md")]["entry_id"], a_eid)
         finally:
             self._unpatch()
 
