@@ -15,13 +15,16 @@ test_sync.py - sync-obsidian-to-lexiang 单元测试 + 集成测试
 """
 
 import json
+import io
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 # 将 scripts 目录加入 path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -66,7 +69,10 @@ from converter import (
     RE_MD_IMAGE,
 )
 from sync import (
+    _build_background_argv,
+    _build_markdown_uploader_command,
     detect_vault_path,
+    build_argument_parser,
     should_exclude,
     scan_vault,
     do_sync,
@@ -78,7 +84,16 @@ from report import (
     generate_report_filename,
     get_reports_dir,
 )
-from lexiang_api import discover_token, _decode_jwt_exp, LexiangError
+from lexiang_api import (
+    DEFAULT_PERSONAL_CREDENTIALS,
+    PERSONAL_PROFILE_DIR,
+    LexiangConnector,
+    discover_token,
+    load_personal_credential,
+    resolve_personal_credential_selector,
+    _decode_jwt_exp,
+    LexiangError,
+)
 
 
 class TestManifest(unittest.TestCase):
@@ -435,45 +450,50 @@ class TestSegments(unittest.TestCase):
             f.write(content)
         return p
 
+    @staticmethod
+    def _read(path):
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
     def test_no_image_single_text_segment(self):
         md = self._md("# 标题\n\n纯文字内容，无图片。")
-        segs = split_into_segments(open(md, encoding="utf-8").read(), md, self.tmpdir, "")
+        segs = split_into_segments(self._read(md), md, self.tmpdir, "")
         self.assertEqual(len(segs), 1)
         self.assertEqual(segs[0].kind, "text")
-        self.assertFalse(has_local_images(open(md, encoding="utf-8").read(), md, self.tmpdir, ""))
+        self.assertFalse(has_local_images(self._read(md), md, self.tmpdir, ""))
 
     def test_wiki_local_image_split(self):
         md = self._md("前文\n\n![[pic.png]]\n\n后文")
-        segs = split_into_segments(open(md, encoding="utf-8").read(), md, self.tmpdir, "")
+        segs = split_into_segments(self._read(md), md, self.tmpdir, "")
         kinds = [s.kind for s in segs]
         self.assertEqual(kinds, ["text", "image", "text"])
         img = next(s for s in segs if s.kind == "image")
         self.assertEqual(os.path.basename(img.image_abs_path), "pic.png")
-        self.assertTrue(has_local_images(open(md, encoding="utf-8").read(), md, self.tmpdir, ""))
+        self.assertTrue(has_local_images(self._read(md), md, self.tmpdir, ""))
 
     def test_md_local_image_split(self):
         md = self._md("段落\n\n![描述](pic.png)\n\n尾段")
-        segs = split_into_segments(open(md, encoding="utf-8").read(), md, self.tmpdir, "")
+        segs = split_into_segments(self._read(md), md, self.tmpdir, "")
         self.assertEqual([s.kind for s in segs], ["text", "image", "text"])
         img = next(s for s in segs if s.kind == "image")
         self.assertEqual(img.image_alt, "描述")
 
     def test_remote_image_stays_in_text(self):
         md = self._md("![x](https://example.com/a.png)\n\n文字")
-        segs = split_into_segments(open(md, encoding="utf-8").read(), md, self.tmpdir, "")
+        segs = split_into_segments(self._read(md), md, self.tmpdir, "")
         # 公网图不切分，整篇是一个 text 片段
         self.assertTrue(all(s.kind == "text" for s in segs))
-        self.assertFalse(has_local_images(open(md, encoding="utf-8").read(), md, self.tmpdir, ""))
+        self.assertFalse(has_local_images(self._read(md), md, self.tmpdir, ""))
 
     def test_missing_local_image_not_split(self):
         # 引用了不存在的图片 → 不当作 image 片段（避免上传失败）
         md = self._md("文字\n\n![[notexist.png]]\n\n更多")
-        segs = split_into_segments(open(md, encoding="utf-8").read(), md, self.tmpdir, "")
+        segs = split_into_segments(self._read(md), md, self.tmpdir, "")
         self.assertTrue(all(s.kind == "text" for s in segs))
 
     def test_multiple_images_order(self):
         md = self._md("A\n\n![[pic.png]]\n\nB\n\n![](pic.png)\n\nC")
-        segs = split_into_segments(open(md, encoding="utf-8").read(), md, self.tmpdir, "")
+        segs = split_into_segments(self._read(md), md, self.tmpdir, "")
         self.assertEqual([s.kind for s in segs],
                          ["text", "image", "text", "image", "text"])
 
@@ -673,15 +693,6 @@ class FakeConnector:
         self.created_folders.append((name, parent_id))
         return eid
 
-    def create_page_with_content(self, space_id, name, content, parent_id=None):
-        eid = self._next("page")
-        self.created_pages.append((name, parent_id))
-        return eid
-
-    def update_page_content(self, entry_id, content, content_type="markdown", force_write=True):
-        self.updated_pages.append(entry_id)
-        return {}
-
     def upload_attachment(self, file_path, parent_entry_id):
         return ""
 
@@ -689,20 +700,6 @@ class FakeConnector:
         eid = self._next("file")
         self.uploaded_files.append((os.path.basename(file_path), parent_entry_id))
         return eid
-
-    # 图文混排相关（供 _create_page/_update_page 图文分支测试）
-    def create_page_with_segments(self, space_id, name, segments, parent_id=None):
-        eid = self._next("page")
-        self.created_pages.append((name, parent_id))
-        img_ok = sum(1 for s in segments if getattr(s, "kind", "") == "image")
-        self.embedded_images = getattr(self, "embedded_images", 0) + img_ok
-        return eid, img_ok, 0
-
-    def update_page_with_segments(self, entry_id, segments):
-        self.updated_pages.append(entry_id)
-        img_ok = sum(1 for s in segments if getattr(s, "kind", "") == "image")
-        self.embedded_images = getattr(self, "embedded_images", 0) + img_ok
-        return img_ok, 0
 
     def get_entry_edited_at(self, entry_id):
         return self.edited_overrides.get(entry_id, 0)
@@ -748,14 +745,44 @@ class TestDoSyncHardening(unittest.TestCase):
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _patch_api(self, fake):
-        """让 do_sync 使用 FakeConnector 而非真实 LexiangConnector"""
+        """让 do_sync 使用 FakeConnector 和假公共上传器，不发网络请求。"""
         import sync as sync_mod
         self._orig = sync_mod.LexiangConnector
+        self._orig_uploader = sync_mod._run_markdown_uploader
         sync_mod.LexiangConnector = lambda *a, **k: fake
+
+        def fake_uploader(source_path, vault_path, attachment_folder, *,
+                          parent_id=None, entry_id=None, name=None, include_images=True,
+                          credential_selector=None):
+            with tempfile.TemporaryDirectory(prefix="test-uploader-") as package_dir:
+                _, image_count = sync_mod._prepare_markdown_package(
+                    source_path,
+                    vault_path,
+                    attachment_folder,
+                    package_dir,
+                    include_images=include_images,
+                )
+            if entry_id:
+                fake.updated_pages.append(entry_id)
+                result_id = entry_id
+            else:
+                result_id = fake._next("page")
+                fake.created_pages.append((name, parent_id))
+            fake.embedded_images = getattr(fake, "embedded_images", 0) + image_count
+            return {
+                "ok": True,
+                "entry_id": result_id,
+                "local_images": image_count,
+                "remote_images": image_count,
+                "verified": True,
+            }
+
+        sync_mod._run_markdown_uploader = fake_uploader
 
     def _unpatch(self):
         import sync as sync_mod
         sync_mod.LexiangConnector = self._orig
+        sync_mod._run_markdown_uploader = self._orig_uploader
 
     def test_idempotent_resume_after_interrupt(self):
         """模拟中断后重跑：manifest 已有部分记录，已同步项跳过，不重复创建"""
@@ -983,7 +1010,7 @@ class TestDoSyncHardening(unittest.TestCase):
             self._unpatch()
 
     def test_local_image_md_uses_segment_path(self):
-        """含本地图片的 md → 走图文混排（create_page_with_segments 内嵌图片）"""
+        """含本地图片的 md → 临时工作包交给公共上传器内嵌图片"""
         # 造一张真实图片
         png = bytes.fromhex(
             "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753"
@@ -1126,6 +1153,175 @@ class TestLexiangConnector(unittest.TestCase):
                 _os.environ.pop("LEXIANG_ONEID_TOKEN", None)
             else:
                 _os.environ["LEXIANG_ONEID_TOKEN"] = old
+
+
+class TestPersonalCredentials(unittest.TestCase):
+    """个人凭证选择与 MCP 鉴权（离线）。"""
+
+    TOKEN = "lxmcp_super_secret_test_token"
+
+    def test_profile_path_resolution(self):
+        default = resolve_personal_credential_selector(
+            profile="default", environ={}
+        )
+        self.assertEqual(default.path, DEFAULT_PERSONAL_CREDENTIALS)
+        named = resolve_personal_credential_selector(
+            profile="obsidian-sync", environ={}
+        )
+        self.assertEqual(
+            named.path, PERSONAL_PROFILE_DIR / "obsidian-sync.json"
+        )
+
+    def test_environment_and_explicit_precedence(self):
+        selected = resolve_personal_credential_selector(
+            profile="explicit",
+            environ={
+                "LEXIANG_UPLOAD_CREDENTIALS": "/tmp/environment.json",
+                "LEXIANG_UPLOAD_PROFILE": "environment",
+            },
+        )
+        self.assertEqual(selected.profile, "explicit")
+        selected = resolve_personal_credential_selector(
+            environ={
+                "LEXIANG_UPLOAD_CREDENTIALS": "/tmp/environment.json",
+                "LEXIANG_UPLOAD_PROFILE": "environment",
+            }
+        )
+        self.assertEqual(selected.path, __import__("pathlib").Path("/tmp/environment.json"))
+        self.assertEqual(selected.profile, "")
+        self.assertIsNone(resolve_personal_credential_selector(environ={}))
+
+    def test_rejects_unsafe_and_conflicting_selectors(self):
+        for profile in ("../escape", "nested/profile", "white space", ""):
+            with self.subTest(profile=profile), self.assertRaises(LexiangError):
+                resolve_personal_credential_selector(profile=profile, environ={})
+        with self.assertRaises(LexiangError):
+            resolve_personal_credential_selector(
+                profile="one", credential_file="/tmp/two.json", environ={}
+            )
+
+    def test_loads_nested_uploader_compatible_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "credential.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({
+                    "auth": {
+                        "access_token": self.TOKEN,
+                        "mcp_company_from": "company-test",
+                    }
+                }, handle)
+            credential = load_personal_credential(path)
+        self.assertEqual(credential["mcp_token"], self.TOKEN)
+        self.assertEqual(credential["company_from"], "company-test")
+
+    def test_personal_mode_uses_bearer_header_and_company_url(self):
+        connector = LexiangConnector(credential={
+            "mcp_token": self.TOKEN,
+            "company_from": "company test",
+        })
+
+        class Response:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b"{}"
+
+        with mock.patch(
+            "lexiang_api.urllib.request.urlopen", return_value=Response()
+        ) as urlopen:
+            connector._post_once("ping")
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.get_header("Authorization"), f"Bearer {self.TOKEN}"
+        )
+        self.assertEqual(
+            request.full_url,
+            "https://mcp.lexiang-app.com/mcp?company_from=company%20test",
+        )
+        self.assertIsNone(request.get_header("X-oneid-access-token"))
+
+    def test_personal_token_not_exposed_by_errors(self):
+        connector = LexiangConnector(credential={
+            "mcp_token": self.TOKEN,
+            "company_from": "company",
+        })
+        error = __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+            connector.mcp_url, 401, "unauthorized", {}, io.BytesIO(b"unauthorized")
+        )
+        with mock.patch(
+            "lexiang_api.urllib.request.urlopen", side_effect=error
+        ), self.assertRaises(LexiangError) as raised:
+            connector._post_once("ping")
+        self.assertNotIn(self.TOKEN, str(raised.exception))
+
+
+class TestCredentialCommandLine(unittest.TestCase):
+    """CLI、uploader 和后台命令的凭证参数透传。"""
+
+    def test_cli_selectors_are_mutually_exclusive(self):
+        parser = build_argument_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args([
+                "--lexiang-profile", "one",
+                "--lexiang-credential-file", "/tmp/two.json",
+            ])
+
+    def test_uploader_command_for_profile_and_file(self):
+        profile = resolve_personal_credential_selector(
+            profile="obsidian-sync", environ={}
+        )
+        command = _build_markdown_uploader_command(
+            "/skill/lexiang_upload.py", "/tmp/note.md",
+            parent_id="parent", name="note", credential_selector=profile,
+        )
+        self.assertEqual(command[-2:], ["--profile", "obsidian-sync"])
+
+        file_selector = resolve_personal_credential_selector(
+            credential_file="~/private/lexiang.json", environ={}
+        )
+        command = _build_markdown_uploader_command(
+            "/skill/lexiang_upload.py", "/tmp/note.md",
+            entry_id="entry", credential_selector=file_selector,
+        )
+        self.assertEqual(command[-2], "--credential-file")
+        self.assertEqual(command[-1], str(file_selector.path))
+
+    def test_background_argv_preserves_selector(self):
+        original = [
+            "--mode", "incremental",
+            "--lexiang-profile", "obsidian-sync",
+            "--background",
+        ]
+        child = _build_background_argv(original, "/skill/sync.py", "/vault")
+        self.assertNotIn("--background", child)
+        self.assertIn("--_bg-child", child)
+        index = child.index("--lexiang-profile")
+        self.assertEqual(child[index + 1], "obsidian-sync")
+        self.assertEqual(child[-2:], ["--vault-path", "/vault"])
+
+    def test_init_persists_selector_without_token(self):
+        with tempfile.TemporaryDirectory() as vault:
+            os.makedirs(os.path.join(vault, ".obsidian"))
+            result = subprocess.run([
+                sys.executable,
+                os.path.join(os.path.dirname(__file__), "sync.py"),
+                "--init",
+                "--vault-path", vault,
+                "--target-space-id", "space",
+                "--lexiang-profile", "obsidian-sync",
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = load_config(vault)
+            serialized = json.dumps(config)
+            self.assertEqual(config["lexiang_profile"], "obsidian-sync")
+            self.assertEqual(config["lexiang_credential_file"], "")
+            self.assertNotIn("lxmcp_", serialized)
 
 
 class TestIsoToTs(unittest.TestCase):
