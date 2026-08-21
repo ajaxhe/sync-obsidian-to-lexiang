@@ -272,6 +272,9 @@ def split_into_segments(
     """
     current_dir = os.path.dirname(file_abs_path)
 
+    # 修复被错误转义的 wikilink
+    content = content.replace("\\![[", "![[")
+
     # 收集所有「本地图片」引用的 (start, end, abs_path, alt)
     spans = []
 
@@ -350,6 +353,9 @@ def convert_file(
     """
     with open(file_abs_path, "r", encoding="utf-8") as f:
         content = f.read()
+
+    # 修复被错误转义的 wikilink（某些编辑工具会把 ![[  写成 \![[）
+    content = content.replace("\\![[", "![[")
 
     # 提取附件
     attachments = extract_attachments(content, file_abs_path, vault_path, attachment_folder)
