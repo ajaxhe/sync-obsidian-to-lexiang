@@ -274,6 +274,9 @@ class LexiangConnector:
 
     # 代理模式下的工具名前缀
     _PROXY_TOOL_PREFIX = "lexiang_"
+    # 通用包装工具：工具未直接下发时，用它转发调用
+    _WRAPPER_TOOL = "call_tool"
+    _TOOL_NOT_ALLOWED_RE = re.compile(r"tool is not allowed", re.IGNORECASE)
 
     def __init__(self, token=None, token_path=None,
                  personal_credential_file=None, credential=None):
@@ -342,6 +345,8 @@ class LexiangConnector:
 
         self._session_id = None
         self._initialized = False
+        # 「工具未下发→改走包装」的日志每工具只打一次，避免刷屏
+        self._wrapped_tools_logged = set()
 
     # ── MCP 协议层 ────────────────────────────────────────────
 
@@ -439,6 +444,19 @@ class LexiangConnector:
         if self.use_proxy and not name.startswith(self._PROXY_TOOL_PREFIX):
             actual_name = self._PROXY_TOOL_PREFIX + name
         resp = self._post("tools/call", {"name": actual_name, "arguments": arguments})
+
+        # 服务端按 company / feature_flag / allowlist 过滤下发的工具集，
+        # 业务工具可能只暴露在通用包装 call_tool 之下（直调返回 tool is not allowed）。
+        # 这既不是业务错误、更不是「数据不存在」，必须改走包装而不是交给上层猜。
+        if self._is_tool_not_allowed(resp) and name != self._WRAPPER_TOOL:
+            if name not in self._wrapped_tools_logged:
+                self._wrapped_tools_logged.add(name)
+                _log(f"  [工具] {name} 本次未被下发，改走 {self._WRAPPER_TOOL} 包装调用")
+            resp = self._post("tools/call", {
+                "name": self._WRAPPER_TOOL,
+                "arguments": {"tool_name": name, "arguments": arguments},
+            })
+
         if "error" in resp:
             raise LexiangError(f"工具 {name} 调用失败: {resp['error']}")
         result = resp.get("result", {})
@@ -448,6 +466,13 @@ class LexiangConnector:
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError:
+                # 纯文本回包：若是「工具不可见」这类工具层错误，必须抛错。
+                # 绝不能 return 出去——上层会把空结果误判成「条目不存在」，进而重建条目（重复）。
+                if self._TOOL_NOT_ALLOWED_RE.search(text):
+                    raise LexiangError(
+                        f"工具 {name} 不可用（未被服务端下发，且 {self._WRAPPER_TOOL} 包装也不可用）: {text}",
+                        retryable=False,
+                    )
                 return text
             # 乐享业务错误码
             if isinstance(parsed, dict) and parsed.get("code") not in (None, 0):
@@ -463,6 +488,30 @@ class LexiangConnector:
                 )
             return parsed
         return result
+
+    @classmethod
+    def _is_tool_not_allowed(cls, resp):
+        """判断回包是否表示「该工具本次未被服务端下发」。"""
+        if not isinstance(resp, dict):
+            return False
+        err = resp.get("error")
+        if err is not None and cls._TOOL_NOT_ALLOWED_RE.search(str(err)):
+            return True
+        result = resp.get("result") or {}
+        if not isinstance(result, dict):
+            return False
+        for item in result.get("content") or []:
+            if not isinstance(item, dict) or item.get("type") != "text":
+                continue
+            text = item.get("text") or ""
+            try:
+                json.loads(text)
+                continue
+            except json.JSONDecodeError:
+                pass
+            if cls._TOOL_NOT_ALLOWED_RE.search(text):
+                return True
+        return False
 
     def call_tool(self, name, arguments):
         """调用 MCP 工具（带业务码层重试），返回解析后的业务数据。"""
@@ -512,7 +561,14 @@ class LexiangConnector:
     def describe_entry(self, entry_id):
         data = self.call_tool("entry_describe_entry",
                               {"entry_id": entry_id, "_mcp_fields": "-html_content,-staffs"})
-        return data.get("data", {}).get("entry", {}) if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            # 非结构化回包是「读不到」，不是「不存在」。
+            # 必须抛错：静默返回空 dict 会让 probe_entry 判定 exists=False，
+            # 进而触发「原 entry 已失效 → 重建」，每跑一次就多一份重复条目。
+            raise LexiangError(
+                f"entry_describe_entry 返回非结构化结果（无法确认条目是否存在）: {str(data)[:200]}"
+            )
+        return data.get("data", {}).get("entry", {}) or {}
 
     def get_entry_edited_at(self, entry_id):
         """获取条目最后编辑时间戳（int 秒），失败返回 0"""
@@ -555,7 +611,13 @@ class LexiangConnector:
         data = self.call_tool("entry_list_children",
                               {"parent_id": parent_id, "limit": limit,
                                "_mcp_fields": "-html_content,-staffs,-source"})
-        return data.get("data", {}).get("entries", []) if isinstance(data, dict) else []
+        if not isinstance(data, dict):
+            # 同上：读不到≠没有子条目。返回空列表会让「同名查重」静默失效，
+            # 从而失去防重复创建的最后一道保险。
+            raise LexiangError(
+                f"entry_list_children 返回非结构化结果（无法确认目录内容）: {str(data)[:200]}"
+            )
+        return data.get("data", {}).get("entries", []) or []
 
     # ── 附件上传（3 步流程）──────────────────────────────────
 

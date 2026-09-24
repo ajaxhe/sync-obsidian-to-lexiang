@@ -273,6 +273,22 @@ def do_sync(vault_path, config, mode, source_dirs, dry_run, persist=None, progre
                 lexiang_children_cache[parent_id] = {}
         return lexiang_children_cache[parent_id].get((match_name, entry_type))
 
+    def find_lexiang_entry_checked(parent_id, match_name, entry_type):
+        """同 find_lexiang_entry，但「查不了」时抛 LexiangError（而不是返回 None）。
+
+        用于「重建前的防重复保险」：必须能区分「确认没有同名条目」和「查不到」，
+        后者宁可跳过本次也不许重建——否则每跑一次同步就多一份重复条目。
+        """
+        if dry_run or not parent_id or not match_name:
+            return None
+        if parent_id not in lexiang_children_cache:
+            children = api.list_children(parent_id, limit=200)  # 失败向上抛，交由调用方处理
+            cache = {}
+            for ch in children:
+                cache[(ch.get("name", ""), ch.get("entry_type", ""))] = ch
+            lexiang_children_cache[parent_id] = cache
+        return lexiang_children_cache[parent_id].get((match_name, entry_type))
+
     def save():
         if persist and not dry_run:
             persist(manifest)
@@ -375,14 +391,35 @@ def do_sync(vault_path, config, mode, source_dirs, dry_run, persist=None, progre
             log(f"  [{kind}] {rel_path} ⚠ 探活失败，跳过（保留映射）: {e}")
             continue
 
-        # entry 已被删除 → 当作新增重建
+        # entry 探活判「不存在」→ 重建前必须先确认目标目录里没有同名条目
         if not info["exists"]:
-            log(f"  [{kind}] {rel_path} 原 entry 已失效，重建")
-            remove_entry(manifest, rel_path)
-            _sync_new(api, space_id, parent_id, name, rel_path, fi, vault_path,
-                      attachment_folder, sync_attachments, report, manifest,
-                      dry_run, save, credential_selector)
-            continue
+            # 🛡 防重复保险：探活可能误判（工具未下发、权限、瞬时异常都会被判成「不存在」）。
+            # 重建前查一次目标目录：命中同名条目就复用它，绝不新建。
+            match_name = name if manifest_type == "page" else os.path.basename(rel_path)
+            try:
+                found = find_lexiang_entry_checked(parent_id, match_name, manifest_type)
+            except LexiangError as e:
+                # 查不了就不许重建——保留映射，下次再试，避免制造重复条目
+                report.record_action("update_page", rel_path, "error", entry_id,
+                                     f"同名查重失败，已跳过重建: {e}")
+                log(f"  [{kind}] {rel_path} ⚠ 无法确认目标目录是否已有同名条目（{e}），保留映射跳过，不重建")
+                continue
+
+            if found and found.get("id") and found["id"] != entry_id:
+                log(f"  [{kind}] {rel_path} 探活判失效，但目标目录已有同名 entry，复用 {found['id'][:12]}…")
+                set_entry(manifest, rel_path, manifest_type, found["id"], "", fi.get("mtime", 0))
+                save()
+                entry_id = found["id"]
+                existing = entries.get(rel_path)
+                info = {"exists": True, "parent_id": found.get("parent_id", ""), "edited_at": 0}
+                # 不 continue，继续走下面的「内容比对 → 更新」，不重建
+            else:
+                log(f"  [{kind}] {rel_path} 原 entry 已失效，重建")
+                remove_entry(manifest, rel_path)
+                _sync_new(api, space_id, parent_id, name, rel_path, fi, vault_path,
+                          attachment_folder, sync_attachments, report, manifest,
+                          dry_run, save, credential_selector)
+                continue
 
         # 移动检测
         moved = (not dry_run and target_folder_id and info["parent_id"]
@@ -757,7 +794,14 @@ def main():
     if args.respect_move is not None:
         config["respect_move"] = args.respect_move
     if args.exclude is not None:
-        config["exclude_patterns"] = args.exclude
+        # 合并而非覆盖：命令行排除项不能冲掉配置里已有的 exclude_patterns。
+        # （曾经是直接赋值并写回 config.json，导致 .obsidian/**、*.canvas、
+        #   attachments/** 三个默认排除项被抹掉，扫描范围暴涨并产生大量无关条目。）
+        merged = list(config.get("exclude_patterns") or DEFAULT_CONFIG["exclude_patterns"])
+        for pattern in args.exclude:
+            if pattern and pattern not in merged:
+                merged.append(pattern)
+        config["exclude_patterns"] = merged
 
     try:
         # 只解析位置并校验选择器，不读取凭证，更不会把 token 写入配置。

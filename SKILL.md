@@ -175,6 +175,39 @@ PDF、Office、独立图片、音视频等作为 file entry 上传。它们不�
 | `scripts/progress.py` | 后台进度 |
 | `scripts/test_sync.py` | 离线回归测试 |
 
+## 工具可见性与 call_tool 包装（重要）
+
+服务端按 company / feature_flag / allowlist 过滤下发的工具集，**业务工具可能不直接可见**，
+直调会返回 `tool is not allowed: <工具名>`。本 Skill 的客户端会自动改走通用包装
+`call_tool(tool_name=…, arguments=…)` 调用，无需人工干预（每个工具只打一条提示日志）。
+
+⚠️ 这类错误**不是**「条目不存在」，也**不是**凭证失效。历史上被误判成「条目不存在」，
+导致每次同步都重建页面、旧页面残留 → 目录里堆出大量同名重复条目。
+现在 `describe_entry` / `list_children` 遇到非结构化回包会**抛错**，
+由调用方按「探活失败 → 保留映射、跳过」处理。
+
+## 重复条目排查与清理（SOP）
+
+症状：目标目录出现同名条目，每次同步后数量增加。
+
+```bash
+# 1) 看历史报告：正常应是「跳过(无变化)」，若出现批量「创建文档」即命中此问题
+ls -t {vault}/.obsidian/plugins/sync-obsidian-to-lexiang/reports | head
+
+# 2) 列目录对账（只读）：保留 validity_type=none 的原件，其余为重复副本
+#    注意要用连接器/包装调用列，别用被白名单拦住的直调
+
+# 3) 清理前先把 manifest 重指向「保留项」并清空 content_hash，
+#    否则残留映射指向已删条目，下次同步会再次重建：
+#      entries[rel_path] = {"type":"page","entry_id":<保留项ID>,"content_hash":"",...}
+#    然后才删除重复副本（entry_delete_entry 经 call_tool 包装可调）。
+
+# 4) 删除后复核：子条目数 == 文件数，且无重名
+```
+
+预防：探活失败**绝不允许**走「重建」分支；重建前必须能确认目标目录无同名条目
+（`find_lexiang_entry_checked`，查不到就跳过）。`--exclude` 只做**合并**，不会覆盖 config 里的排除项。
+
 ## 测试
 
 ```bash
