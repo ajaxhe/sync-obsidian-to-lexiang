@@ -47,6 +47,7 @@ from manifest import (
 from converter import (
     get_obsidian_attachment_folder,
     split_into_segments, convert_wikilinks,
+    extract_embedded_media, replace_embedded_media, video_slot_marker,
 )
 from lexiang_api import (
     LexiangConnector,
@@ -458,9 +459,13 @@ def do_sync(vault_path, config, mode, source_dirs, dry_run, persist=None, progre
                 log(f"  [page] {rel_path} ⚠ 乐享侧有更新，跳过")
                 continue
 
+        media_map = _resolve_media_map(
+            api, fi, vault_path, attachment_folder, parent_id or space_id,
+            report, manifest, save, sync_attachments,
+        )
         _update_page(api, entry_id, rel_path, fi, vault_path, attachment_folder,
                      sync_attachments, parent_id, space_id, report, manifest,
-                     dry_run, save, credential_selector)
+                     dry_run, save, credential_selector, media_map)
 
     if progress:
         progress.state["done"] = len(scan["files"])
@@ -508,9 +513,13 @@ def _sync_new(api, space_id, parent_id, name, rel_path, fi, vault_path,
         _create_file(api, parent_id, rel_path, fi, space_id, report, manifest,
                      dry_run, save)
     else:
+        media_map = _resolve_media_map(
+            api, fi, vault_path, attachment_folder, parent_id,
+            report, manifest, save, sync_attachments,
+        )
         _create_page(api, space_id, parent_id, name, rel_path, fi, vault_path,
                      attachment_folder, sync_attachments, report, manifest,
-                     dry_run, save, credential_selector)
+                     dry_run, save, credential_selector, media_map)
 
 
 def _create_file(api, parent_id, rel_path, fi, space_id, report, manifest, dry_run, save):
@@ -552,9 +561,10 @@ def _find_markdown_uploader():
 
 
 def _prepare_markdown_package(
-        source_path, vault_path, attachment_folder, package_dir, include_images=True):
+        source_path, vault_path, attachment_folder, package_dir, include_images=True,
+        media_map=None):
     """Convert Obsidian syntax and stage local images beside a temporary Markdown."""
-    source = _read_text(source_path)
+    source = replace_embedded_media(_read_text(source_path), media_map)
     segments = split_into_segments(source, source_path, vault_path, attachment_folder)
     image_dir = Path(package_dir) / "images"
     output = []
@@ -596,7 +606,7 @@ def _build_markdown_uploader_command(
 
 def _run_markdown_uploader(source_path, vault_path, attachment_folder, *,
                            parent_id=None, entry_id=None, name=None, include_images=True,
-                           credential_selector=None):
+                           credential_selector=None, media_map=None):
     uploader = _find_markdown_uploader()
     with tempfile.TemporaryDirectory(prefix="obsidian-lexiang-") as package_dir:
         staged, image_count = _prepare_markdown_package(
@@ -605,6 +615,7 @@ def _run_markdown_uploader(source_path, vault_path, attachment_folder, *,
             attachment_folder,
             package_dir,
             include_images=include_images,
+            media_map=media_map,
         )
         command = _build_markdown_uploader_command(
             uploader,
@@ -627,9 +638,107 @@ def _run_markdown_uploader(source_path, vault_path, attachment_folder, *,
         return result
 
 
+def _resolve_media_map(api, fi, vault_path, attachment_folder, parent_id,
+                       report, manifest, save, sync_attachments):
+    """上传正文内嵌的非图片附件（视频/PDF 等），返回 {引用: 乐享URL}。
+
+    内容未变的附件复用 manifest 里缓存的 URL，避免每次同步重复上传大文件。
+    任何单个附件失败都不阻断整篇同步，降级为占位文本。
+    """
+    rel_path = fi["rel_path"]
+    if not api or not sync_attachments:
+        return {}
+    try:
+        embedded = extract_embedded_media(
+            _read_text(fi["abs_path"]), fi["abs_path"], vault_path, attachment_folder)
+    except OSError:
+        return {}
+    if not embedded:
+        return {}
+
+    cache = manifest.setdefault("attachments", {}).setdefault(rel_path, {})
+    media_map = {}
+    for att in embedded:
+        try:
+            digest = compute_content_hash(att.abs_path)
+        except OSError:
+            digest = ""
+        cached = cache.get(att.rel_path)
+        if cached and digest and cached.get("hash") == digest and cached.get("file_id"):
+            info = {"file_id": cached["file_id"], "name": att.file_name}
+            media_map[att.rel_path] = info
+            media_map[att.file_name] = info
+            continue
+        try:
+            uploaded = api.upload_media(att.abs_path, parent_id)
+        except LexiangError as e:
+            report.record_action("upload_attachment", att.rel_path, "error", "", str(e)[:120])
+            log(f"  [附件] {att.rel_path} ✗ {e}")
+            continue
+        if not uploaded.get("file_id"):
+            report.record_action("upload_attachment", att.rel_path, "error", "", "未返回 file_id")
+            continue
+        cache[att.rel_path] = {"file_id": uploaded["file_id"], "hash": digest}
+        info = {"file_id": uploaded["file_id"], "name": att.file_name}
+        media_map[att.rel_path] = info
+        media_map[att.file_name] = info
+        report.record_action("upload_attachment", att.rel_path, "success", "", "")
+        log(f"  [附件] {att.rel_path} ✓ 已上传，稍后内嵌为视频块")
+    if media_map:
+        save()
+    return media_map
+
+
+def _embed_media_blocks(api, entry_id, media_map, report):
+    """把正文里的视频占位段落换成乐享 File 块（可预览播放）。
+
+    OpenAPI 块类型白名单里没有 video，写 <Video>/<video> 会被拒绝，
+    统一用 <File file-id=... view-type="preview"> 呈现视频。
+    替换失败不阻断：正文保留占位文本，下次同步会重试。
+    """
+    if not api or not entry_id or not media_map:
+        return 0
+    names = []
+    for info in media_map.values():
+        if isinstance(info, dict) and info.get("file_id") and info.get("name"):
+            if info["name"] not in names:
+                names.append(info["name"])
+    if not names:
+        return 0
+    markers = [video_slot_marker(name) for name in names]
+    try:
+        found = api.find_blocks_by_text(entry_id, markers)
+    except LexiangError as e:
+        log(f"  [视频] 定位占位段落失败，保留占位文本: {e}")
+        return 0
+    by_marker = {}
+    for info in media_map.values():
+        if isinstance(info, dict) and info.get("file_id"):
+            by_marker[video_slot_marker(info["name"])] = info
+    replacements = []
+    for marker, block_id in found.items():
+        info = by_marker.get(marker)
+        if not info:
+            continue
+        replacements.append({
+            "block_id": block_id,
+            "file_id": info["file_id"],
+            "name": info["name"],
+        })
+    if not replacements:
+        return 0
+    try:
+        api.replace_blocks_with_files(entry_id, replacements)
+    except LexiangError as e:
+        log(f"  [视频] 内嵌失败（正文保留占位）: {e}")
+        return 0
+    log(f"  [视频] 已内嵌 {len(replacements)} 个视频块")
+    return len(replacements)
+
+
 def _create_page(api, space_id, parent_id, name, rel_path, fi, vault_path,
                  attachment_folder, sync_attachments, report, manifest, dry_run, save,
-                 credential_selector=None):
+                 credential_selector=None, media_map=None):
     if dry_run:
         report.record_action("create_page", rel_path, "success", "", "dry-run")
         return
@@ -642,14 +751,19 @@ def _create_page(api, space_id, parent_id, name, rel_path, fi, vault_path,
             name=name,
             include_images=sync_attachments,
             credential_selector=credential_selector,
+            media_map=media_map,
         )
         entry_id = result["entry_id"]
         set_entry(manifest, rel_path, "page", entry_id, fi["hash"], fi["mtime"])
         save()
         image_count = result.get("local_images", 0)
+        video_count = _embed_media_blocks(api, entry_id, media_map, report)
         note = f"公共上传器 verified=true，图片 {image_count}"
+        if video_count:
+            note += f"，视频 {video_count}"
         report.record_action("create_page", rel_path, "success", entry_id, note)
-        log(f"  [文档] {rel_path} ✓ (图片 {image_count})")
+        log(f"  [文档] {rel_path} ✓ (图片 {image_count}" +
+            (f"，视频 {video_count}" if video_count else "") + ")")
     except LexiangError as e:
         report.record_action("create_page", rel_path, "error", "", str(e)[:120])
         log(f"  [文档] {rel_path} ✗ {e}")
@@ -657,7 +771,7 @@ def _create_page(api, space_id, parent_id, name, rel_path, fi, vault_path,
 
 def _update_page(api, entry_id, rel_path, fi, vault_path, attachment_folder,
                  sync_attachments, parent_id, space_id, report, manifest, dry_run, save,
-                 credential_selector=None):
+                 credential_selector=None, media_map=None):
     if dry_run:
         report.record_action("update_page", rel_path, "success", entry_id, "dry-run 覆盖")
         return
@@ -669,18 +783,24 @@ def _update_page(api, entry_id, rel_path, fi, vault_path, attachment_folder,
             entry_id=entry_id,
             include_images=sync_attachments,
             credential_selector=credential_selector,
+            media_map=media_map,
         )
         set_entry(manifest, rel_path, "page", entry_id, fi["hash"], fi["mtime"])
         save()
         image_count = result.get("local_images", 0)
+        video_count = _embed_media_blocks(api, entry_id, media_map, report)
+        note = f"公共上传器 verified=true，图片 {image_count}"
+        if video_count:
+            note += f"，视频 {video_count}"
         report.record_action(
             "update_page",
             rel_path,
             "success",
             entry_id,
-            f"公共上传器 verified=true，图片 {image_count}",
+            note,
         )
-        log(f"  [文档] {rel_path} ↻ 已更新 (图片 {image_count})")
+        log(f"  [文档] {rel_path} ↻ 已更新 (图片 {image_count}" +
+            (f"，视频 {video_count}" if video_count else "") + ")")
     except LexiangError as e:
         report.record_action("update_page", rel_path, "error", entry_id, str(e)[:120])
         log(f"  [文档] {rel_path} ✗ {e}")

@@ -639,17 +639,31 @@ class LexiangConnector:
             "upload_type": 2,  # PRE_SIGNED_URL
         })
         data = apply.get("data", apply) if isinstance(apply, dict) else {}
-        session = data.get("session", data)
-        session_id = session.get("session_id") or session.get("id")
-        # 预签名 URL 在 session.objects[0].upload_url（单文件场景）
+        # 服务端多种回包形态：data.client_upload_session / data.session / 扁平 data
+        session = (data.get("client_upload_session")
+                   or data.get("upload_session")
+                   or data.get("session")
+                   or data)
+        session_id = session.get("session_id") or session.get("id") or data.get("session_id")
+        # 单文件场景：预签名 URL 在 object / objects[0] 里
+        obj = session.get("object") or session.get("objects") or {}
+        if isinstance(obj, list):
+            obj = obj[0] if obj else {}
         upload_url = ""
-        objects = session.get("objects") or []
-        if objects:
-            upload_url = objects[0].get("upload_url") or objects[0].get("url", "")
+        extra_headers = {}
+        if isinstance(obj, dict) and obj:
+            upload_url = obj.get("upload_url") or obj.get("url") or ""
             # mime 以 apply 返回为准（影响签名一致性）
-            mime = objects[0].get("mime_type") or mime
+            mime = obj.get("mime_type") or mime
+            declared = obj.get("headers")
+            if isinstance(declared, dict):
+                extra_headers = {k: v for k, v in declared.items()
+                                 if k.lower() in ("content-type", "content-disposition")}
         if not upload_url:  # 兼容可能的扁平结构
             upload_url = session.get("upload_url") or session.get("url", "")
+        auth = session.get("auth") or (obj.get("auth") if isinstance(obj, dict) else None) or {}
+        if isinstance(auth, dict) and auth.get("XCosSecurityToken"):
+            extra_headers["x-cos-security-token"] = auth["XCosSecurityToken"]
         if not (session_id and upload_url):
             raise LexiangError(f"申请上传失败: {json.dumps(apply, ensure_ascii=False)[:200]}")
 
@@ -657,9 +671,10 @@ class LexiangConnector:
         # 签名要求 content-length + content-type + host，必须严格匹配
         with open(file_path, "rb") as f:
             file_data = f.read()
+        put_headers = {"Content-Type": mime, "Content-Length": str(len(file_data))}
+        put_headers.update(extra_headers)
         put_req = urllib.request.Request(
-            upload_url, data=file_data, method="PUT",
-            headers={"Content-Type": mime, "Content-Length": str(len(file_data))},
+            upload_url, data=file_data, method="PUT", headers=put_headers,
         )
         try:
             with urllib.request.urlopen(put_req, timeout=300) as r:
@@ -676,8 +691,73 @@ class LexiangConnector:
     def upload_attachment(self, file_path, parent_entry_id):
         """上传 markdown 引用的附件，返回访问 URL（用于替换正文引用）"""
         entry = self._upload_3step(file_path, parent_entry_id)
-        return (entry.get("download") or entry.get("url")
-                or entry.get("access_url") or "")
+        url = (entry.get("download") or entry.get("url")
+               or entry.get("access_url") or "")
+        if url:
+            return url
+        # 文件/视频型 entry 不返回下载地址，用条目页链接代替（乐享会渲染成条目卡片）
+        entry_id = entry.get("id")
+        return f"https://lexiangla.com/pages/{entry_id}" if entry_id else ""
+
+    def upload_media(self, file_path, parent_entry_id):
+        """上传视频/附件等媒体，返回 {file_id, entry_id, url}。
+
+        file_id 用于正文块（<File file-id=...>）内嵌引用；entry_id 是条目 ID。
+        OpenAPI 写入层的块类型白名单里没有 video，所以视频在正文里用 File
+        块（view-type=preview）呈现，不要写 <Video> / <video>。
+        """
+        entry = self._upload_3step(file_path, parent_entry_id)
+        entry_id = entry.get("id") or ""
+        return {
+            "file_id": entry.get("target_id") or entry_id,
+            "entry_id": entry_id,
+            "url": f"https://lexiangla.com/pages/{entry_id}" if entry_id else "",
+        }
+
+    def replace_blocks_with_files(self, entry_id, replacements):
+        """把页面里若干 block 替换为 File 块（视频/附件内嵌）。
+
+        replacements: [{"block_id": "...", "file_id": "...", "name": "..."}]
+        OpenAPI 不接受 video 块类型，统一写 File + view-type=preview。
+        """
+        if not replacements:
+            return {"replaced": 0}
+        block_replacements = []
+        for item in replacements:
+            name = (item.get("name") or "").replace('"', "")
+            block_replacements.append({
+                "block_id": item["block_id"],
+                "new_str": (
+                    f'<File file-id="{item["file_id"]}" name="{name}" '
+                    f'view-type="preview">{name}</File>'
+                ),
+            })
+        return self.call_tool("block_update_page", {
+            "entry_id": entry_id,
+            "command": "replace_blocks",
+            "content_format": "mdx",
+            "block_replacements": block_replacements,
+        })
+
+    def find_blocks_by_text(self, entry_id, markers):
+        """在页面 mdx 里按占位文本找 Paragraph 的 block_id。
+
+        markers: [占位文本]，返回 {占位文本: block_id}（找不到则不出现在结果里）。
+        """
+        import re as _re
+        page = self.call_tool("block_fetch_page",
+                              {"entry_id": entry_id, "render_mode": "mdx"})
+        text = page if isinstance(page, str) else json.dumps(page, ensure_ascii=False)
+        found = {}
+        for marker in markers:
+            match = _re.search(
+                r'<Paragraph data-id="([^"]+)"[^>]*>[^<]*'
+                + _re.escape(marker),
+                text,
+            )
+            if match:
+                found[marker] = match.group(1)
+        return found
 
     def upload_file_entry(self, file_path, parent_entry_id):
         """

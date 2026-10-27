@@ -17,12 +17,14 @@ test_sync.py - sync-obsidian-to-lexiang 单元测试 + 集成测试
 import json
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -61,6 +63,9 @@ from converter import (
     resolve_obsidian_path,
     is_image_file,
     is_attachment_file,
+    extract_embedded_media,
+    replace_embedded_media,
+    video_slot_marker,
     get_obsidian_attachment_folder,
     split_into_segments,
     has_local_images,
@@ -68,6 +73,7 @@ from converter import (
     RE_WIKI_LINK,
     RE_MD_IMAGE,
 )
+import sync as sync_mod
 from sync import (
     _build_background_argv,
     _build_markdown_uploader_command,
@@ -498,6 +504,98 @@ class TestSegments(unittest.TestCase):
                          ["text", "image", "text", "image", "text"])
 
 
+class TestEmbeddedMedia(unittest.TestCase):
+    """内嵌视频/附件：不得生成指向本地的无效图片引用（会阻断整篇同步）"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="test_media_")
+        os.makedirs(os.path.join(self.tmpdir, "attachments"), exist_ok=True)
+        self.video = os.path.join(self.tmpdir, "attachments", "demo.mp4")
+        with open(self.video, "wb") as f:
+            f.write(b"fake-mp4")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_extract_only_non_image(self):
+        content = "图 ![[pic.png]]\n\n视频 ![[attachments/demo.mp4]]"
+        media = extract_embedded_media(
+            content, os.path.join(self.tmpdir, "doc.md"), self.tmpdir, "")
+        self.assertEqual(len(media), 1)
+        self.assertEqual(os.path.basename(media[0].abs_path), "demo.mp4")
+        self.assertFalse(media[0].is_image)
+
+    def test_replace_without_file_degrades_to_text(self):
+        out = replace_embedded_media("前文\n\n![[attachments/demo.mp4]]\n\n后文")
+        self.assertNotIn("![", out)
+        self.assertIn("demo.mp4", out)
+
+    def test_replace_with_file_id_becomes_slot(self):
+        out = replace_embedded_media(
+            "![[attachments/demo.mp4]]",
+            {"attachments/demo.mp4": {"file_id": "file_1", "name": "demo.mp4"}},
+        )
+        self.assertIn(video_slot_marker("demo.mp4"), out)
+        self.assertNotIn("![", out)
+
+    def test_replace_with_url_becomes_link(self):
+        out = replace_embedded_media(
+            "![[attachments/demo.mp4]]",
+            {"attachments/demo.mp4": "https://lexiangla.com/x/demo.mp4"},
+        )
+        self.assertIn("](https://lexiangla.com/x/demo.mp4)", out)
+        self.assertNotIn("![", out)
+
+    def test_embed_media_blocks_replaces_slots(self):
+        """占位段落应被换成 File 块（video 不在 OpenAPI 白名单里）"""
+
+        class _MediaApi:
+            def __init__(self, mapping):
+                self.mapping = mapping
+                self.calls = []
+
+            def find_blocks_by_text(self, entry_id, markers):
+                return self.mapping
+
+            def replace_blocks_with_files(self, entry_id, replacements):
+                self.calls.append((entry_id, replacements))
+
+        fake = _MediaApi({video_slot_marker("demo.mp4"): "blk_1"})
+        count = sync_mod._embed_media_blocks(
+            fake, "entry_1",
+            {"attachments/demo.mp4": {"file_id": "file_1", "name": "demo.mp4"}},
+            SyncReport(mode="incremental", vault_path=self.tmpdir,
+                       target_space_id="s", target_folder_id="f",
+                       conflict_strategy="obsidian_wins"),
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(len(fake.calls), 1)
+        _, replacements = fake.calls[0]
+        self.assertEqual(replacements[0]["block_id"], "blk_1")
+        self.assertEqual(replacements[0]["file_id"], "file_1")
+
+    def test_image_embed_untouched(self):
+        out = replace_embedded_media("![[pic.png]]")
+        self.assertEqual(out, "![[pic.png]]")
+
+    def test_package_has_no_dangling_local_media(self):
+        """临时包里的图片引用必须都真实存在，否则上传器预检会拒绝整篇"""
+        md_path = os.path.join(self.tmpdir, "doc.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write("视频\n\n![[attachments/demo.mp4]]\n\n结束")
+        with tempfile.TemporaryDirectory(prefix="test-pkg-") as package_dir:
+            staged, _ = sync_mod._prepare_markdown_package(
+                md_path, self.tmpdir, "attachments", package_dir)
+            text = staged.read_text(encoding="utf-8")
+            for target in re.findall(r"!\[[^\]]*\]\(([^)]+)\)", text):
+                if target.startswith(("http://", "https://", "//")):
+                    continue
+                self.assertTrue(
+                    (Path(package_dir) / target).is_file(),
+                    f"临时包缺少图片文件: {target}",
+                )
+
+
 class TestSync(unittest.TestCase):
     """sync.py 集成测试"""
 
@@ -753,7 +851,7 @@ class TestDoSyncHardening(unittest.TestCase):
 
         def fake_uploader(source_path, vault_path, attachment_folder, *,
                           parent_id=None, entry_id=None, name=None, include_images=True,
-                          credential_selector=None):
+                          credential_selector=None, media_map=None):
             with tempfile.TemporaryDirectory(prefix="test-uploader-") as package_dir:
                 _, image_count = sync_mod._prepare_markdown_package(
                     source_path,
@@ -761,6 +859,7 @@ class TestDoSyncHardening(unittest.TestCase):
                     attachment_folder,
                     package_dir,
                     include_images=include_images,
+                    media_map=media_map,
                 )
             if entry_id:
                 fake.updated_pages.append(entry_id)

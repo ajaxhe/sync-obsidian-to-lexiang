@@ -55,6 +55,16 @@ def is_image_file(filename: str) -> bool:
     return ext in IMAGE_EXTENSIONS
 
 
+def is_embedded_media(filename: str) -> bool:
+    """是否为「非图片内嵌媒体/附件」（视频、音频、PDF 等）。
+
+    这类引用无法作为图片随 Markdown 一起上传（公共上传器只接受 image），
+    必须单独上传后换成外链，否则预检会报「缺少图片文件」并阻断整篇同步。
+    """
+    _, ext = os.path.splitext(filename.lower())
+    return bool(ext) and ext in ATTACHMENT_EXTENSIONS
+
+
 def is_attachment_file(filename: str) -> bool:
     """判断是否为附件文件（图片或其他附件）"""
     _, ext = os.path.splitext(filename.lower())
@@ -176,6 +186,68 @@ def extract_attachments(
             ))
 
     return attachments
+
+
+def extract_embedded_media(
+    content: str,
+    file_abs_path: str,
+    vault_path: str,
+    attachment_folder: str = "",
+) -> List[Attachment]:
+    """提取正文中内嵌的「非图片」引用（mp4/mov/pdf/zip 等）。
+
+    这些附件不会进入图片片段，需由调用方单独上传到乐享后换成外链。
+    """
+    return [
+        att for att in extract_attachments(
+            content, file_abs_path, vault_path, attachment_folder)
+        if not att.is_image
+    ]
+
+
+VIDEO_SLOT_PREFIX = "VIDEO_SLOT:"
+
+
+def video_slot_marker(name: str) -> str:
+    """正文里的视频占位标记（导入后由 block 替换成乐享 File 块）。"""
+    return f"{VIDEO_SLOT_PREFIX}{name}"
+
+
+def replace_embedded_media(content: str, media_map=None) -> str:
+    """把非图片内嵌引用换成视频占位标记或链接；拿不到资源时降级为占位文本。
+
+    media_map: {引用名或文件名: {"file_id":..., "name":...} 或 "https://..."}
+    视频不能写成 ![](path)：公共上传器只接受图片，预检会拒绝整篇。
+    有 file_id 时先落占位段落，导入成功后再换成 File block（可预览播放）。
+    """
+    media_map = media_map or {}
+
+    def replacement(ref: str, alt: str) -> str:
+        info = media_map.get(ref) or media_map.get(os.path.basename(ref))
+        name = os.path.basename(ref)
+        if isinstance(info, dict) and info.get("file_id"):
+            return f"\n\n{video_slot_marker(info.get('name') or name)}\n\n"
+        if isinstance(info, str) and info:
+            return f"\n\n[{alt}]({info})\n\n"
+        return f"\n\n[{alt}（附件未随文同步）]()\n\n"
+
+    def wiki_repl(match):
+        ref = match.group(1).strip()
+        if is_image_file(ref):
+            return match.group(0)  # 图片走 image 片段，不动
+        alt = (match.group(2) or os.path.basename(ref)).strip()
+        return replacement(ref, alt)
+
+    def md_repl(match):
+        path = match.group(2).strip()
+        alt = (match.group(1) or os.path.basename(path)).strip()
+        if path.startswith(("http://", "https://", "//")) or is_image_file(path):
+            return match.group(0)
+        return replacement(path, alt)
+
+    content = RE_WIKI_IMAGE.sub(wiki_repl, content)
+    content = RE_MD_IMAGE.sub(md_repl, content)
+    return content
 
 
 def convert_wikilinks(

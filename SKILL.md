@@ -4,7 +4,7 @@ description: >-
   Obsidian vault 到腾讯乐享知识库的单向全量或增量同步工具。保留目录结构，
   同步 Markdown 图文和独立附件。Markdown 页面统一复用
   upload-markdown-to-lexiang。用户提到同步 Obsidian 到乐享、笔记同步知识库时使用。
-version: "2.1.2"
+version: "2.2.0"
 category: productivity
 tags: obsidian, lexiang, sync, markdown, chinese, knowledge-base
 agent_created: true
@@ -134,6 +134,32 @@ stdout 只输出 JSON 摘要和报告路径；进度写 stderr 或 `progress.jso
 
 临时工作包在单篇完成后自动删除，不是第二份上传源码。
 
+### 正文内嵌的非图片附件（视频/PDF 等）
+
+`![[x.mp4]]` 这类内嵌不是图片，公共上传器不接受，早期版本会生成指向临时包内不存在路径的
+`![](attachments/.../x.mp4)`，被预检「缺少图片文件」拦下，**整篇同步失败**。
+
+现在处理方式：
+
+1. `extract_embedded_media` 单独收集非图片内嵌；
+2. 用连接器 3 步上传（视频走 VOD），拿到 `file_id`（entry.target_id）；
+3. 正文先落一行占位 `VIDEO_SLOT:<文件名>`，页面导入成功后
+   `block_fetch_page`(mdx) 定位该段落，再 `replace_blocks` 换成
+   `<File file-id=... name=... view-type="preview">`，即文档内可预览播放的视频块；
+4. `file_id` 与内容 hash 缓存进 `manifest.attachments[rel_path]`，内容未变不重复上传大文件；
+5. 单个附件上传或内嵌失败**不阻断**整篇，正文保留占位/占位文本，下次同步重试。
+
+⚠️ 两个已验证的坑：
+
+- OpenAPI 写入层的块类型白名单**没有 video**，写 `<Video>`/`<video>` 一律报
+  `block_type: value must be in list [... "attachment","image" ...]`。视频只能走 File 块。
+- 早期版本把视频换成 `https://lexiangla.com/pages/<entry_id>` 外链，导入后会被改写成
+  `<mention-page>`，正文里显示成一串 entry id，很难看——不要用外链方案。
+- 附件上传回包是 `data.client_upload_session.object.upload_url`（VOD），
+  不是 `data.session.objects[0]`。
+
+注意：死链图片（源文件在 vault 里根本不存在）仍会阻断该篇——那是源数据问题，需修 Obsidian 侧。
+
 ### 独立文件
 
 PDF、Office、独立图片、音视频等作为 file entry 上传。它们不调用公共 Markdown 上传器。
@@ -169,7 +195,7 @@ PDF、Office、独立图片、音视频等作为 file entry 上传。它们不�
 |---|---|
 | `scripts/sync.py` | 扫描、调度、临时 Markdown 工作包、调用公共 CLI |
 | `scripts/lexiang_api.py` | 目录、探活和独立附件，不含 Markdown page 上传 |
-| `scripts/converter.py` | Obsidian 语法和附件解析 |
+| `scripts/converter.py` | Obsidian 语法、图片切片和非图片内嵌附件解析 |
 | `scripts/manifest.py` | 配置与 manifest |
 | `scripts/report.py` | 同步报告 |
 | `scripts/progress.py` | 后台进度 |
