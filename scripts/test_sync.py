@@ -1500,11 +1500,14 @@ class TestDetectVault(unittest.TestCase):
 class TestRealVault(unittest.TestCase):
     """对真实 vault 凡哥杂谈 的集成测试"""
 
-    VAULT_PATH = "/Users/ajaxhe/Obsidian/凡哥杂谈"
-    TARGET_SPACE_ID = "cc9dc48a4a8845ff83c3d403840ae189"
-    TARGET_FOLDER_ID = "303b0714d2c94735ae1fdaaac4c4f77b"
+    # 本机专用集成测试：路径从环境变量读，缺失则跳过（不要把本机路径写死在仓库里）
+    VAULT_PATH = os.environ.get("OBSIDIAN_VAULT_PATH", os.path.expanduser("~/Obsidian/凡哥杂谈"))
+    TARGET_SPACE_ID = os.environ.get("LEXIANG_TEST_SPACE_ID", "")
+    TARGET_FOLDER_ID = os.environ.get("LEXIANG_TEST_FOLDER_ID", "")
 
     def setUp(self):
+        if not self.TARGET_SPACE_ID or not self.TARGET_FOLDER_ID:
+            self.skipTest("LEXIANG_TEST_SPACE_ID / LEXIANG_TEST_FOLDER_ID not set")
         if not os.path.isdir(self.VAULT_PATH):
             self.skipTest("Vault not found, skip real vault test")
 
