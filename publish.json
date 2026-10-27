@@ -1,10 +1,17 @@
 {
   "skill_name": "sync-obsidian-to-lexiang",
   "display_name": "Sync Obsidian to Lexiang",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "github_repo": "ajaxhe/sync-obsidian-to-lexiang",
   "category": "productivity",
-  "tags": ["obsidian", "lexiang", "sync", "markdown", "chinese", "knowledge-base"],
+  "tags": [
+    "obsidian",
+    "lexiang",
+    "sync",
+    "markdown",
+    "chinese",
+    "knowledge-base"
+  ],
   "clawscan_note": "Delegates Markdown publishing to upload-markdown-to-lexiang with a Lexiang personal credential. The connector remains limited to directories, probing, and standalone attachments.",
   "dependencies": [
     {
@@ -14,9 +21,34 @@
   ],
   "pr_description": "## sync-obsidian-to-lexiang\n\nOne-way sync from Obsidian vault to Tencent Lexiang knowledge base.\n\n**Features:**\n- Full and incremental sync\n- Directory structure preservation\n- Markdown + images + attachments\n- Zero-config OAuth via agent connector\n- Zero token: scripts run outside LLM context",
   "platforms": {
-    "clawhub": { "enabled": true },
-    "agentskillhub": { "enabled": true },
-    "skillshubai": { "enabled": true },
-    "agentskillshub": { "enabled": false }
+    "clawhub": {
+      "enabled": true
+    },
+    "agentskillhub": {
+      "enabled": true
+    },
+    "skillshubai": {
+      "enabled": true
+    },
+    "agentskillshub": {
+      "enabled": false
+    }
+  },
+  "changelog": "重写中文名称与检索型描述，补充 skillhub.cn 中文元数据",
+  "platform_overrides": {
+    "skillhub": {
+      "slug": "sync-obsidian-to-lexiang",
+      "displayName": "Obsidian 同步乐享",
+      "summary": "把 Obsidian vault 单向同步到乐享知识库：保留目录结构，Markdown 图文与独立附件一起同步，按内容哈希走增量，支持中断恢复与冲突保护。",
+      "description": "为「用 Obsidian 写作、用乐享沉淀」的团队设计的同步工具：扫描 vault 目录树，按 content hash 判断哪些笔记真的变了，只跑增量；目录结构、Markdown 图文和独立附件一起到位；带 manifest、文件锁和中断恢复，网络中断后重跑不会产生重复页面；对目的端被移动或改动过的页面走冲突策略，避免覆盖别人的修改。真正的 Markdown 页面写入交给「Markdown 上传到乐享」，本 Skill 只管同步编排。适用场景：个人笔记沉淀到团队知识库、文档站搬家、写作库定期备份、多设备笔记统一到乐享。关键词：Obsidian 同步、笔记迁移、增量同步、目录结构保留、附件上传、断点续传、冲突保护。",
+      "tags": [
+        "Obsidian同步",
+        "笔记迁移",
+        "增量同步",
+        "断点续传",
+        "附件上传",
+        "知识库同步"
+      ]
+    }
   }
 }

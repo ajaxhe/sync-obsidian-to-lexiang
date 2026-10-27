@@ -4,7 +4,7 @@ description: >-
   Obsidian vault 到腾讯乐享知识库的单向全量或增量同步工具。保留目录结构，
   同步 Markdown 图文和独立附件。Markdown 页面统一复用
   upload-markdown-to-lexiang。用户提到同步 Obsidian 到乐享、笔记同步知识库时使用。
-version: "2.1.1"
+version: "2.1.2"
 category: productivity
 tags: obsidian, lexiang, sync, markdown, chinese, knowledge-base
 agent_created: true
