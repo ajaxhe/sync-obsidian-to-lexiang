@@ -158,9 +158,27 @@ stdout 只输出 JSON 摘要和报告路径；进度写 stderr 或 `progress.jso
 
 ⚠️ 已验证的坑（不要回退到这些方案）：
 
-- **不要走 `file_apply_upload`/VOD 上传视频**（`upload_media`/`_upload_3step`）：
-  会在 parent 目录创建 video 条目（视频与文章同级，污染目录），且服务端 VOD
-  转码一律报 `video_content_empty`，正文块无法播放（2026-10-28 实测 5/5 失败）。
+- **Video 块当前无法通过 OpenAPI/MCP 创建（2026-10-28 全路径实测，结论可靠）**：
+  MCP 文档宣称 `<Video file-id/>` 可创建，但线上 OpenAPI 块写入层白名单
+  （p/h1-h5/.../attachment/image/smartsheet）**没有 video**。以下路径全部失败，勿重复尝试：
+  ① `block_update_page` 三命令（replace_blocks/update_content/replace_content）× mdx/markdown 双格式；
+  ② `block_create_block_descendant` block_type=video（proto 白名单同拒）；
+  ③ `block_convert_content_to_blocks`（video 标签被静默丢弃）；
+  ④ attachment 块引用 VOD 视频 file_id（不会自动转 video 块，仍是 File）；
+  ⑤ `block_update_block`（只支持文本/表格/任务，无类型转换）；
+  ⑥ `file_apply_upload` 带 block_id（报「无编辑权限」，路径不通）；
+  ⑦ HTML bundle 导入（extension=html + .zip 名）：产物是 .html **文件条目**，不转在线文档；
+  ⑧ Markdown 草稿管道（draft_save/publish_markdown_draft）：只更新页面的 .md 文件版本，
+  对 colab 页 blocks 无效。
+  **切换预案**：若服务端白名单补上 video，把 `_create_attachment_block` 建块后追加一步
+  `block_update_page replace_blocks`（mdx `<Video file-id name width height align/>`）即可。
+- **VOD 转码全失败 video_content_empty（服务端问题）**：`file_apply_upload` 走 VOD 的视频
+  （mime video/*）100% 转码失败，含全新 ffmpeg 生成的标准 mp4（实测 6/6）。原始文件字节完好、
+  可下载、ffprobe 验证合法——是服务端 VOD 转码/注册问题，客户端无解。即使 Video 块白名单
+  放开，引用 VOD file_id 的块大概率也播不了；块附件 COS 文件（本 skill 现用路径）是否可用于
+  Video 块待白名单放开后验证。
+- **不要走 `file_apply_upload`/VOD 上传视频用于正文内嵌**（`upload_media`/`_upload_3step`）：
+  会在 parent 目录创建 video 条目（视频与文章同级，污染目录），且转码失败见上条。
   `upload_media` 已标记废弃，仅供旧路径兼容。
 - OpenAPI 写入层的块类型白名单**没有 video**（`block_update_page` mdx 和
   `block_create_block_descendant` 原子工具都不接受），写 `<Video>`/`<video>` 一律报
@@ -173,6 +191,8 @@ stdout 只输出 JSON 摘要和报告路径；进度写 stderr 或 `progress.jso
   Content-Type + Content-Length 两个头**，多带（如 Content-Disposition）会 403。
 - `block_apply_block_attachment_upload` 本身不走 VOD（返回普通 COS 会话），所以
   视频也走它；工具描述里「暂不支持视频（VOD）上传」恰恰说明块附件才是正路。
+- File 块（attachment，view-type=preview）对 mp4 **没有内嵌播放器**（2026-10-28 凡哥 UI 实测），
+  只能点击查看/下载；这是当前 API 边界内的最优形态，等 Video 块白名单放开后切换。
 - 独立视频文件（作为 file entry 上传到目录）仍走 `upload_file_entry` 的 VOD 路径，
   同样有 `video_content_empty` 风险——已知限制，暂未处理。
 
