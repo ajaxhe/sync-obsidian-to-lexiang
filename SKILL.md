@@ -196,8 +196,10 @@ stdout 只输出 JSON 摘要和报告路径；进度写 stderr 或 `progress.jso
   Content-Type + Content-Length 两个头**，多带（如 Content-Disposition）会 403。
 - `block_apply_block_attachment_upload` 本身不走 VOD（返回普通 COS 会话），所以
   视频也走它；工具描述里「暂不支持视频（VOD）上传」恰恰说明块附件才是正路。
-- File 块（attachment，view-type=preview）对 mp4 **没有内嵌播放器**（2026-10-28 凡哥 UI 实测），
-  只能点击查看/下载；这是当前 API 边界内的最优形态，等 Video 块白名单放开后切换。
+- File 块（attachment，view-type=preview）对 mp4 **没有内嵌播放器**（2026-10-28 凡哥 UI 实测
+  两轮确认：引用 COS 块附件文件、以及引用编辑器正常转码的 VOD 文件，都不能播放，只能点击
+  查看/下载）——**附件挂载是当前 API 边界内的最终形态**（凡哥已拍板），文档内可播放的
+  Video 块需等服务端放开白名单 + page 模式上传后按预案切换。
 - 独立视频文件（作为 file entry 上传到目录）仍走 `upload_file_entry` 的 VOD 路径，
   同样有 `video_content_empty` 风险——已知限制，暂未处理。
 
