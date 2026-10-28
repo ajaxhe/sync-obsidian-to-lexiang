@@ -459,9 +459,8 @@ def do_sync(vault_path, config, mode, source_dirs, dry_run, persist=None, progre
                 log(f"  [page] {rel_path} ⚠ 乐享侧有更新，跳过")
                 continue
 
-        media_map = _resolve_media_map(
-            api, fi, vault_path, attachment_folder, parent_id or space_id,
-            report, manifest, save, sync_attachments,
+        media_map = _plan_embedded_media(
+            fi, vault_path, attachment_folder, manifest, sync_attachments,
         )
         _update_page(api, entry_id, rel_path, fi, vault_path, attachment_folder,
                      sync_attachments, parent_id, space_id, report, manifest,
@@ -513,9 +512,8 @@ def _sync_new(api, space_id, parent_id, name, rel_path, fi, vault_path,
         _create_file(api, parent_id, rel_path, fi, space_id, report, manifest,
                      dry_run, save)
     else:
-        media_map = _resolve_media_map(
-            api, fi, vault_path, attachment_folder, parent_id,
-            report, manifest, save, sync_attachments,
+        media_map = _plan_embedded_media(
+            fi, vault_path, attachment_folder, manifest, sync_attachments,
         )
         _create_page(api, space_id, parent_id, name, rel_path, fi, vault_path,
                      attachment_folder, sync_attachments, report, manifest,
@@ -638,15 +636,18 @@ def _run_markdown_uploader(source_path, vault_path, attachment_folder, *,
         return result
 
 
-def _resolve_media_map(api, fi, vault_path, attachment_folder, parent_id,
-                       report, manifest, save, sync_attachments):
-    """上传正文内嵌的非图片附件（视频/PDF 等），返回 {引用: 乐享URL}。
+def _plan_embedded_media(fi, vault_path, attachment_folder, manifest,
+                         sync_attachments):
+    """收集正文内嵌的非图片附件（视频/PDF 等）计划，不做任何上传。
 
-    内容未变的附件复用 manifest 里缓存的 URL，避免每次同步重复上传大文件。
-    任何单个附件失败都不阻断整篇同步，降级为占位文本。
+    返回 media_map：{rel_path: info, file_name: info}，
+    info = {"rel_path", "abs_path", "name", "hash", "file_id"(缓存或空)}。
+
+    实际上传/块创建在页面导入成功后由 _embed_media_blocks 完成：
+    块附件上传（block_apply_block_attachment_upload）需要页面 entry_id，
+    且文件记录挂在页面上（不产生目录条目），必须先有页面。
     """
-    rel_path = fi["rel_path"]
-    if not api or not sync_attachments:
+    if not sync_attachments:
         return {}
     try:
         embedded = extract_embedded_media(
@@ -655,8 +656,7 @@ def _resolve_media_map(api, fi, vault_path, attachment_folder, parent_id,
         return {}
     if not embedded:
         return {}
-
-    cache = manifest.setdefault("attachments", {}).setdefault(rel_path, {})
+    cache = manifest.setdefault("attachments", {}).get(fi["rel_path"], {})
     media_map = {}
     for att in embedded:
         try:
@@ -664,76 +664,93 @@ def _resolve_media_map(api, fi, vault_path, attachment_folder, parent_id,
         except OSError:
             digest = ""
         cached = cache.get(att.rel_path)
-        if cached and digest and cached.get("hash") == digest and cached.get("file_id"):
-            info = {"file_id": cached["file_id"], "name": att.file_name}
-            media_map[att.rel_path] = info
-            media_map[att.file_name] = info
-            continue
-        try:
-            uploaded = api.upload_media(att.abs_path, parent_id)
-        except LexiangError as e:
-            report.record_action("upload_attachment", att.rel_path, "error", "", str(e)[:120])
-            log(f"  [附件] {att.rel_path} ✗ {e}")
-            continue
-        if not uploaded.get("file_id"):
-            report.record_action("upload_attachment", att.rel_path, "error", "", "未返回 file_id")
-            continue
-        cache[att.rel_path] = {"file_id": uploaded["file_id"], "hash": digest}
-        info = {"file_id": uploaded["file_id"], "name": att.file_name}
+        file_id = ""
+        if cached and digest and cached.get("hash") == digest:
+            file_id = cached.get("file_id") or ""
+        info = {
+            "rel_path": att.rel_path, "abs_path": att.abs_path,
+            "name": os.path.basename(att.abs_path), "hash": digest,
+            "file_id": file_id,
+        }
         media_map[att.rel_path] = info
         media_map[att.file_name] = info
-        report.record_action("upload_attachment", att.rel_path, "success", "", "")
-        log(f"  [附件] {att.rel_path} ✓ 已上传，稍后内嵌为视频块")
-    if media_map:
-        save()
+        media_map[os.path.basename(att.abs_path)] = info
     return media_map
 
 
-def _embed_media_blocks(api, entry_id, media_map, report):
-    """把正文里的视频占位段落换成乐享 File 块（可预览播放）。
+def _embed_media_blocks(api, entry_id, rel_path, media_map, report, manifest, save):
+    """把正文视频占位段落换成页面级附件块（文档内预览，不产生目录条目）。
 
-    OpenAPI 块类型白名单里没有 video，写 <Video>/<video> 会被拒绝，
-    统一用 <File file-id=... view-type="preview"> 呈现视频。
-    替换失败不阻断：正文保留占位文本，下次同步会重试。
+    流程（每个附件独立，失败不阻断整篇，占位保留待下次重试）：
+    1. manifest 缓存命中（hash 一致）→ 用 file_id 直接创建 attachment 块；
+       未命中或复用失败 → block_apply_block_attachment_upload + PUT +
+       session 建块（与编辑器插入附件同路径）；
+    2. fetch mdx 定位 VIDEO_SLOT 占位段落；
+    3. 把新块移动到占位段之后，删除占位段。
+
+    ⚠️ 视频不能走 file_apply_upload/VOD：会在目录创建 video 条目，且服务端
+    转码一律 video_content_empty，正文块无法播放（2026-10-28 实测）。
+    ⚠️ OpenAPI 块类型白名单没有 video，统一用 attachment 块
+    （File 组件，view-type=preview）。
     """
     if not api or not entry_id or not media_map:
         return 0
-    names = []
+    # 去重：media_map 同时含 rel_path 和 file_name 两个键指向同一 info
+    seen = {}
     for info in media_map.values():
-        if isinstance(info, dict) and info.get("file_id") and info.get("name"):
-            if info["name"] not in names:
-                names.append(info["name"])
-    if not names:
+        if isinstance(info, dict) and info.get("rel_path"):
+            seen[info["rel_path"]] = info
+    if not seen:
         return 0
-    markers = [video_slot_marker(name) for name in names]
+    # 批量定位占位段落（定位失败不阻断：块保留在文末，仍是有效内嵌）
+    markers = [video_slot_marker(i["name"]) for i in seen.values()]
     try:
         found = api.find_blocks_by_text(entry_id, markers)
     except LexiangError as e:
-        log(f"  [视频] 定位占位段落失败，保留占位文本: {e}")
-        return 0
-    by_marker = {}
-    for info in media_map.values():
-        if isinstance(info, dict) and info.get("file_id"):
-            by_marker[video_slot_marker(info["name"])] = info
-    replacements = []
-    for marker, block_id in found.items():
-        info = by_marker.get(marker)
-        if not info:
+        log(f"  [附件] 定位占位段落失败，附件块保留在文末: {e}")
+        found = {}
+    doc_cache = manifest.setdefault("attachments", {}).setdefault(rel_path, {})
+    embedded = 0
+    for att_rel, info in seen.items():
+        digest = info.get("hash") or ""
+        block_id = file_id = parent_id = ""
+        cached = doc_cache.get(att_rel)
+        if (cached and digest and cached.get("hash") == digest
+                and cached.get("file_id")):
+            try:
+                block_id, file_id, parent_id = api.create_attachment_block(
+                    entry_id, cached["file_id"], info["name"])
+            except LexiangError as e:
+                log(f"  [附件] {att_rel} 缓存 file_id 建块失败，改重传: {e}")
+                block_id = ""
+        if not block_id:
+            try:
+                block_id, file_id, parent_id = api.upload_block_attachment(
+                    entry_id, info["abs_path"])
+            except LexiangError as e:
+                report.record_action("upload_attachment", att_rel, "error",
+                                     "", str(e)[:120])
+                log(f"  [附件] {att_rel} ✗ {e}")
+                continue
+        if not file_id:
+            report.record_action("upload_attachment", att_rel, "error",
+                                 "", "未返回 file_id")
+            log(f"  [附件] {att_rel} ✗ 未返回 file_id")
             continue
-        replacements.append({
-            "block_id": block_id,
-            "file_id": info["file_id"],
-            "name": info["name"],
-        })
-    if not replacements:
-        return 0
-    try:
-        api.replace_blocks_with_files(entry_id, replacements)
-    except LexiangError as e:
-        log(f"  [视频] 内嵌失败（正文保留占位）: {e}")
-        return 0
-    log(f"  [视频] 已内嵌 {len(replacements)} 个视频块")
-    return len(replacements)
+        doc_cache[att_rel] = {"file_id": file_id, "hash": digest}
+        save()
+        # 移动到占位段之后并删除占位段；失败不回滚（块留在文末仍可播放）
+        placeholder = found.get(video_slot_marker(info["name"]))
+        if placeholder and parent_id:
+            try:
+                api.move_blocks_after(entry_id, [block_id], parent_id, placeholder)
+                api.delete_blocks(entry_id, [placeholder])
+            except LexiangError as e:
+                log(f"  [附件] {att_rel} 移动/删占位失败（块保留在文末）: {e}")
+        report.record_action("upload_attachment", att_rel, "success", "", "")
+        log(f"  [附件] {att_rel} ✓ 已内嵌为附件块")
+        embedded += 1
+    return embedded
 
 
 def _create_page(api, space_id, parent_id, name, rel_path, fi, vault_path,
@@ -757,7 +774,8 @@ def _create_page(api, space_id, parent_id, name, rel_path, fi, vault_path,
         set_entry(manifest, rel_path, "page", entry_id, fi["hash"], fi["mtime"])
         save()
         image_count = result.get("local_images", 0)
-        video_count = _embed_media_blocks(api, entry_id, media_map, report)
+        video_count = _embed_media_blocks(
+            api, entry_id, rel_path, media_map, report, manifest, save)
         note = f"公共上传器 verified=true，图片 {image_count}"
         if video_count:
             note += f"，视频 {video_count}"
@@ -788,7 +806,8 @@ def _update_page(api, entry_id, rel_path, fi, vault_path, attachment_folder,
         set_entry(manifest, rel_path, "page", entry_id, fi["hash"], fi["mtime"])
         save()
         image_count = result.get("local_images", 0)
-        video_count = _embed_media_blocks(api, entry_id, media_map, report)
+        video_count = _embed_media_blocks(
+            api, entry_id, rel_path, media_map, report, manifest, save)
         note = f"公共上传器 verified=true，图片 {image_count}"
         if video_count:
             note += f"，视频 {video_count}"

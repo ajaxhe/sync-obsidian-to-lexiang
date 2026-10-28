@@ -22,6 +22,7 @@ token 文件发现：
 
 import glob
 import json
+import mimetypes
 import os
 import re
 import time
@@ -702,9 +703,12 @@ class LexiangConnector:
     def upload_media(self, file_path, parent_entry_id):
         """上传视频/附件等媒体，返回 {file_id, entry_id, url}。
 
-        file_id 用于正文块（<File file-id=...>）内嵌引用；entry_id 是条目 ID。
-        OpenAPI 写入层的块类型白名单里没有 video，所以视频在正文里用 File
-        块（view-type=preview）呈现，不要写 <Video> / <video>。
+        ⚠️ 已废弃于正文内嵌场景（2026-10-28 实测）：
+        - 该路径走 file_apply_upload/VOD，会在 parent 目录创建 video 条目，
+          污染目录（视频与文章同级）；
+        - 服务端 VOD 转码一律报 video_content_empty，正文块无法播放。
+        正文内嵌视频请用 upload_block_attachment（页面级块附件，与编辑器
+        插入附件同路径）。本方法仅供独立文件上传等旧路径兼容。
         """
         entry = self._upload_3step(file_path, parent_entry_id)
         entry_id = entry.get("id") or ""
@@ -714,30 +718,102 @@ class LexiangConnector:
             "url": f"https://lexiangla.com/pages/{entry_id}" if entry_id else "",
         }
 
-    def replace_blocks_with_files(self, entry_id, replacements):
-        """把页面里若干 block 替换为 File 块（视频/附件内嵌）。
+    # ── 页面级块附件（正文内嵌视频/附件的正路） ────────────────
 
-        replacements: [{"block_id": "...", "file_id": "...", "name": "..."}]
-        OpenAPI 不接受 video 块类型，统一写 File + view-type=preview。
+    def upload_block_attachment(self, entry_id, file_path, view_type="preview"):
+        """页面级块附件上传：与编辑器「插入附件/视频」同路径。
+
+        返回 (block_id, file_id, parent_block_id)：
+        - block_id：在页面末尾创建的 attachment 块（随后可 move 到正文位置）
+        - file_id：文件记录 ID（缓存进 manifest，页面重写后可复用建块）
+        - parent_block_id：页面根块 ID（move 时的 parent_block_id 参数）
+
+        视频内嵌必须走这条路：
+        - file_apply_upload 的 VOD 路径会在目录创建 video 条目，且服务端
+          转码一律 video_content_empty，正文块无法播放；
+        - 块级附件走普通 COS（上海），文件记录挂在页面上，不产生目录条目。
         """
-        if not replacements:
-            return {"replaced": 0}
-        block_replacements = []
-        for item in replacements:
-            name = (item.get("name") or "").replace('"', "")
-            block_replacements.append({
-                "block_id": item["block_id"],
-                "new_str": (
-                    f'<File file-id="{item["file_id"]}" name="{name}" '
-                    f'view-type="preview">{name}</File>'
-                ),
-            })
+        mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        size = os.path.getsize(file_path)
+        name = os.path.basename(file_path)
+        applied = self.call_tool("block_apply_block_attachment_upload", {
+            "entry_id": entry_id, "name": name, "mime_type": mime,
+            "size": str(size)})
+        data = applied.get("data", applied) if isinstance(applied, dict) else {}
+        session_id = data.get("session_id")
+        upload_url = data.get("upload_url")
+        if not session_id or not upload_url:
+            raise LexiangError(
+                f"块附件未获得上传会话: {json.dumps(applied, ensure_ascii=False)[:200]}")
+        # Content-Type/Content-Length 是预签名头（X-Amz-SignedHeaders），
+        # 必须精确匹配且不能附带其他头，否则 403。
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+        req = urllib.request.Request(
+            upload_url, data=file_data, method="PUT", headers={
+                "Content-Type": mime, "Content-Length": str(len(file_data))})
+        try:
+            with urllib.request.urlopen(req, timeout=1800) as r:
+                if r.status not in (200, 201, 204):
+                    raise LexiangError(f"块附件 PUT 失败 status={r.status}")
+        except urllib.error.HTTPError as e:
+            raise LexiangError(
+                f"块附件 PUT 失败 [{e.code}]: "
+                f"{e.read().decode('utf-8','replace')[:200]}")
+        return self._create_attachment_block(
+            entry_id, session_id=session_id, name=name, view_type=view_type)
+
+    def create_attachment_block(self, entry_id, file_id, name, view_type="preview"):
+        """用已有 file_id 在页面末尾创建 attachment 块（复用文件，不重传）。
+
+        返回 (block_id, file_id, parent_block_id)。file_id 失效会抛
+        LexiangError，由调用方降级为重新上传。
+        """
+        return self._create_attachment_block(
+            entry_id, file_id=file_id, name=name, view_type=view_type)
+
+    def _create_attachment_block(self, entry_id, *, session_id=None, file_id=None,
+                                 name, view_type="preview"):
+        """在页面末尾创建 attachment 块；session_id（新上传）与 file_id（复用）二选一。
+
+        OpenAPI 块类型白名单没有 video/file，统一用 attachment 块
+        （fetch 渲染为 File 组件，view-type=preview 可预览播放）。
+        """
+        att = {"view_type": view_type}
+        if session_id:
+            att["session_id"] = session_id
+        else:
+            if not file_id:
+                raise LexiangError("创建 attachment 块需要 session_id 或 file_id")
+            att["file_id"] = file_id
+        temp_id = f"att_{uuid.uuid4().hex[:10]}"
+        result = self.call_tool("block_create_block_descendant", {
+            "entry_id": entry_id, "index": -1,
+            "descendant": [{
+                "block_id": temp_id, "block_type": "attachment", "attachment": att,
+            }],
+            "children": [temp_id]})
+        data = result.get("data", result) if isinstance(result, dict) else {}
+        blocks = data.get("descendant") or []
+        if not blocks:
+            raise LexiangError(
+                f"attachment 块创建失败: {json.dumps(result, ensure_ascii=False)[:200]}")
+        blk = blocks[0]
+        returned_file_id = (blk.get("attachment") or {}).get("file_id") or ""
+        return (blk.get("block_id") or "",
+                returned_file_id or file_id or "",
+                blk.get("parent_id") or "")
+
+    def move_blocks_after(self, entry_id, block_ids, parent_block_id, after_block_id):
+        """把若干块移动到同一父节点下某块之后（用于把附件块挪到占位段位置）。"""
+        return self.call_tool("block_move_blocks", {
+            "entry_id": entry_id, "block_ids": block_ids,
+            "parent_block_id": parent_block_id, "after": after_block_id})
+
+    def delete_blocks(self, entry_id, block_ids):
+        """删除页面正文块（占位段落用完后清除）。"""
         return self.call_tool("block_update_page", {
-            "entry_id": entry_id,
-            "command": "replace_blocks",
-            "content_format": "mdx",
-            "block_replacements": block_replacements,
-        })
+            "entry_id": entry_id, "command": "delete_blocks", "block_ids": block_ids})
 
     def find_blocks_by_text(self, entry_id, markers):
         """在页面 mdx 里按占位文本找 Paragraph 的 block_id。

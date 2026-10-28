@@ -139,24 +139,42 @@ stdout 只输出 JSON 摘要和报告路径；进度写 stderr 或 `progress.jso
 `![[x.mp4]]` 这类内嵌不是图片，公共上传器不接受，早期版本会生成指向临时包内不存在路径的
 `![](attachments/.../x.mp4)`，被预检「缺少图片文件」拦下，**整篇同步失败**。
 
-现在处理方式：
+现在处理方式（**页面级块附件**，与乐享编辑器「插入附件/视频」同路径，2026-10-28 定版）：
 
-1. `extract_embedded_media` 单独收集非图片内嵌；
-2. 用连接器 3 步上传（视频走 VOD），拿到 `file_id`（entry.target_id）；
-3. 正文先落一行占位 `VIDEO_SLOT:<文件名>`，页面导入成功后
-   `block_fetch_page`(mdx) 定位该段落，再 `replace_blocks` 换成
-   `<File file-id=... name=... view-type="preview">`，即文档内可预览播放的视频块；
-4. `file_id` 与内容 hash 缓存进 `manifest.attachments[rel_path]`，内容未变不重复上传大文件；
-5. 单个附件上传或内嵌失败**不阻断**整篇，正文保留占位/占位文本，下次同步重试。
+1. `extract_embedded_media` 单独收集非图片内嵌（计划阶段不上传）；
+2. 正文先落一行占位 `VIDEO_SLOT:<文件名>`，公共上传器完成页面创建/覆盖；
+3. 页面导入成功后，对每个附件：
+   - manifest 缓存命中（hash 一致）→ `create_attachment_block` 用缓存 `file_id`
+     直接建块（不重传大文件）；复用失败自动降级重传；
+   - 未命中 → `block_apply_block_attachment_upload`（entry_id=页面）申请会话 →
+     PUT 字节 → `block_create_block_descendant`(attachment, session_id) 建块并拿 `file_id`；
+4. `block_fetch_page`(mdx) 定位 `VIDEO_SLOT` 占位段落，`block_move_blocks`
+   把附件块移动到占位段之后，`delete_blocks` 删除占位段；
+5. `file_id` 与内容 hash 缓存进 `manifest.attachments[rel_path]`；
+6. 单个附件上传或内嵌失败**不阻断**整篇，正文保留占位文本，下次同步重试。
 
-⚠️ 两个已验证的坑：
+效果：视频直接内嵌在文档正文中（File 块 view-type=preview，可预览播放），
+**不产生与文章同级的目录条目**。
 
-- OpenAPI 写入层的块类型白名单**没有 video**，写 `<Video>`/`<video>` 一律报
-  `block_type: value must be in list [... "attachment","image" ...]`。视频只能走 File 块。
+⚠️ 已验证的坑（不要回退到这些方案）：
+
+- **不要走 `file_apply_upload`/VOD 上传视频**（`upload_media`/`_upload_3step`）：
+  会在 parent 目录创建 video 条目（视频与文章同级，污染目录），且服务端 VOD
+  转码一律报 `video_content_empty`，正文块无法播放（2026-10-28 实测 5/5 失败）。
+  `upload_media` 已标记废弃，仅供旧路径兼容。
+- OpenAPI 写入层的块类型白名单**没有 video**（`block_update_page` mdx 和
+  `block_create_block_descendant` 原子工具都不接受），写 `<Video>`/`<video>` 一律报
+  `block_type: value must be in list [... "attachment","image" ...]`。视频只能用
+  attachment 块（fetch 渲染为 File 组件）。
 - 早期版本把视频换成 `https://lexiangla.com/pages/<entry_id>` 外链，导入后会被改写成
   `<mention-page>`，正文里显示成一串 entry id，很难看——不要用外链方案。
-- 附件上传回包是 `data.client_upload_session.object.upload_url`（VOD），
-  不是 `data.session.objects[0]`。
+- `block_apply_block_attachment_upload` 返回的预签名 URL 的
+  `X-Amz-SignedHeaders` 只含 content-length/content-type/host，PUT 时**只能带
+  Content-Type + Content-Length 两个头**，多带（如 Content-Disposition）会 403。
+- `block_apply_block_attachment_upload` 本身不走 VOD（返回普通 COS 会话），所以
+  视频也走它；工具描述里「暂不支持视频（VOD）上传」恰恰说明块附件才是正路。
+- 独立视频文件（作为 file entry 上传到目录）仍走 `upload_file_entry` 的 VOD 路径，
+  同样有 `video_content_empty` 风险——已知限制，暂未处理。
 
 注意：死链图片（源文件在 vault 里根本不存在）仍会阻断该篇——那是源数据问题，需修 Obsidian 侧。
 
@@ -194,7 +212,7 @@ PDF、Office、独立图片、音视频等作为 file entry 上传。它们不�
 | 文件 | 职责 |
 |---|---|
 | `scripts/sync.py` | 扫描、调度、临时 Markdown 工作包、调用公共 CLI |
-| `scripts/lexiang_api.py` | 目录、探活和独立附件，不含 Markdown page 上传 |
+| `scripts/lexiang_api.py` | 目录、探活、独立附件和页面级块附件上传，不含 Markdown page 上传 |
 | `scripts/converter.py` | Obsidian 语法、图片切片和非图片内嵌附件解析 |
 | `scripts/manifest.py` | 配置与 manifest |
 | `scripts/report.py` | 同步报告 |

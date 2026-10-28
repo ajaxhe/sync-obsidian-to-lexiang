@@ -196,7 +196,8 @@ def extract_embedded_media(
 ) -> List[Attachment]:
     """提取正文中内嵌的「非图片」引用（mp4/mov/pdf/zip 等）。
 
-    这些附件不会进入图片片段，需由调用方单独上传到乐享后换成外链。
+    这些附件不会进入图片片段，由调用方在页面导入后以页面级块附件
+    （attachment 块）内嵌到正文，不产生目录条目。
     """
     return [
         att for att in extract_attachments(
@@ -214,18 +215,20 @@ def video_slot_marker(name: str) -> str:
 
 
 def replace_embedded_media(content: str, media_map=None) -> str:
-    """把非图片内嵌引用换成视频占位标记或链接；拿不到资源时降级为占位文本。
+    """把非图片内嵌引用换成占位标记或链接；拿不到资源时降级为占位文本。
 
-    media_map: {引用名或文件名: {"file_id":..., "name":...} 或 "https://..."}
+    media_map: {引用名或文件名: {"name":..., "file_id":...} 或 "https://..."}
     视频不能写成 ![](path)：公共上传器只接受图片，预检会拒绝整篇。
-    有 file_id 时先落占位段落，导入成功后再换成 File block（可预览播放）。
+    dict 值（无论是否已有 file_id）→ 先落占位段落，页面导入成功后由
+    _embed_media_blocks 上传为页面级附件块并替换（不产生目录条目）；
+    上传/替换失败时占位保留，下次同步重试。
     """
     media_map = media_map or {}
 
     def replacement(ref: str, alt: str) -> str:
         info = media_map.get(ref) or media_map.get(os.path.basename(ref))
         name = os.path.basename(ref)
-        if isinstance(info, dict) and info.get("file_id"):
+        if isinstance(info, dict):
             return f"\n\n{video_slot_marker(info.get('name') or name)}\n\n"
         if isinstance(info, str) and info:
             return f"\n\n[{alt}]({info})\n\n"

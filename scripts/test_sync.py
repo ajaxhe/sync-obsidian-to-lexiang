@@ -538,6 +538,15 @@ class TestEmbeddedMedia(unittest.TestCase):
         self.assertIn(video_slot_marker("demo.mp4"), out)
         self.assertNotIn("![", out)
 
+    def test_replace_with_dict_without_file_id_becomes_slot(self):
+        """media_map 只要有 dict（未上传）也落占位：上传在页面导入之后"""
+        out = replace_embedded_media(
+            "![[attachments/demo.mp4]]",
+            {"attachments/demo.mp4": {"name": "demo.mp4"}},
+        )
+        self.assertIn(video_slot_marker("demo.mp4"), out)
+        self.assertNotIn("![", out)
+
     def test_replace_with_url_becomes_link(self):
         out = replace_embedded_media(
             "![[attachments/demo.mp4]]",
@@ -547,32 +556,165 @@ class TestEmbeddedMedia(unittest.TestCase):
         self.assertNotIn("![", out)
 
     def test_embed_media_blocks_replaces_slots(self):
-        """占位段落应被换成 File 块（video 不在 OpenAPI 白名单里）"""
+        """占位段应被换成页面级附件块（upload → move → delete 占位）"""
 
         class _MediaApi:
             def __init__(self, mapping):
                 self.mapping = mapping
-                self.calls = []
+                self.uploads = []
+                self.reused = []
+                self.moves = []
+                self.deletes = []
 
             def find_blocks_by_text(self, entry_id, markers):
                 return self.mapping
 
-            def replace_blocks_with_files(self, entry_id, replacements):
-                self.calls.append((entry_id, replacements))
+            def upload_block_attachment(self, entry_id, file_path, view_type="preview"):
+                self.uploads.append(file_path)
+                return "blk_new", "file_new", "root_1"
 
-        fake = _MediaApi({video_slot_marker("demo.mp4"): "blk_1"})
+            def create_attachment_block(self, entry_id, file_id, name,
+                                        view_type="preview"):
+                self.reused.append(file_id)
+                return "blk_cache", file_id, "root_1"
+
+            def move_blocks_after(self, entry_id, block_ids, parent_block_id, after):
+                self.moves.append((block_ids, parent_block_id, after))
+
+            def delete_blocks(self, entry_id, block_ids):
+                self.deletes.append(block_ids)
+
+        fake = _MediaApi({video_slot_marker("demo.mp4"): "blk_slot"})
+        manifest = {"attachments": {}}
+        report = SyncReport(mode="incremental", vault_path=self.tmpdir,
+                            target_space_id="s", target_folder_id="f",
+                            conflict_strategy="obsidian_wins")
+        media_map = {"attachments/demo.mp4": {
+            "rel_path": "attachments/demo.mp4", "abs_path": self.video,
+            "name": "demo.mp4", "hash": "h1", "file_id": "",
+        }}
         count = sync_mod._embed_media_blocks(
-            fake, "entry_1",
-            {"attachments/demo.mp4": {"file_id": "file_1", "name": "demo.mp4"}},
-            SyncReport(mode="incremental", vault_path=self.tmpdir,
-                       target_space_id="s", target_folder_id="f",
-                       conflict_strategy="obsidian_wins"),
-        )
+            fake, "entry_1", "doc.md", media_map, report, manifest, lambda: None)
         self.assertEqual(count, 1)
-        self.assertEqual(len(fake.calls), 1)
-        _, replacements = fake.calls[0]
-        self.assertEqual(replacements[0]["block_id"], "blk_1")
-        self.assertEqual(replacements[0]["file_id"], "file_1")
+        # 未命中缓存 → 走上传
+        self.assertEqual(fake.uploads, [self.video])
+        self.assertEqual(fake.reused, [])
+        # 块移动到占位段之后，占位段被删除
+        self.assertEqual(fake.moves, [(["blk_new"], "root_1", "blk_slot")])
+        self.assertEqual(fake.deletes, [["blk_slot"]])
+        # file_id + hash 写入 manifest 缓存
+        cached = manifest["attachments"]["doc.md"]["attachments/demo.mp4"]
+        self.assertEqual(cached["file_id"], "file_new")
+        self.assertEqual(cached["hash"], "h1")
+
+    def test_embed_media_blocks_reuses_cached_file_id(self):
+        """缓存命中（hash 一致）→ 用 file_id 直接建块，不重传大文件"""
+
+        class _MediaApi:
+            def __init__(self):
+                self.uploads = []
+                self.reused = []
+
+            def find_blocks_by_text(self, entry_id, markers):
+                return {video_slot_marker("demo.mp4"): "blk_slot"}
+
+            def upload_block_attachment(self, entry_id, file_path, view_type="preview"):
+                self.uploads.append(file_path)
+                return "blk_new", "file_new", "root_1"
+
+            def create_attachment_block(self, entry_id, file_id, name,
+                                        view_type="preview"):
+                self.reused.append(file_id)
+                return "blk_cache", file_id, "root_1"
+
+            def move_blocks_after(self, entry_id, block_ids, parent_block_id, after):
+                pass
+
+            def delete_blocks(self, entry_id, block_ids):
+                pass
+
+        fake = _MediaApi()
+        manifest = {"attachments": {"doc.md": {
+            "attachments/demo.mp4": {"file_id": "file_old", "hash": "h1"},
+        }}}
+        report = SyncReport(mode="incremental", vault_path=self.tmpdir,
+                            target_space_id="s", target_folder_id="f",
+                            conflict_strategy="obsidian_wins")
+        media_map = {"attachments/demo.mp4": {
+            "rel_path": "attachments/demo.mp4", "abs_path": self.video,
+            "name": "demo.mp4", "hash": "h1", "file_id": "file_old",
+        }}
+        count = sync_mod._embed_media_blocks(
+            fake, "entry_1", "doc.md", media_map, report, manifest, lambda: None)
+        self.assertEqual(count, 1)
+        self.assertEqual(fake.reused, ["file_old"])
+        self.assertEqual(fake.uploads, [])
+
+    def test_embed_media_blocks_falls_back_to_upload(self):
+        """缓存 file_id 建块失败 → 降级重新上传，不阻断"""
+
+        class _MediaApi:
+            def __init__(self):
+                self.uploads = []
+
+            def find_blocks_by_text(self, entry_id, markers):
+                return {}
+
+            def upload_block_attachment(self, entry_id, file_path, view_type="preview"):
+                self.uploads.append(file_path)
+                return "blk_new", "file_new", "root_1"
+
+            def create_attachment_block(self, entry_id, file_id, name,
+                                        view_type="preview"):
+                raise sync_mod.LexiangError("file_id 失效")
+
+            def move_blocks_after(self, entry_id, block_ids, parent_block_id, after):
+                pass
+
+            def delete_blocks(self, entry_id, block_ids):
+                pass
+
+        fake = _MediaApi()
+        manifest = {"attachments": {"doc.md": {
+            "attachments/demo.mp4": {"file_id": "file_old", "hash": "h1"},
+        }}}
+        report = SyncReport(mode="incremental", vault_path=self.tmpdir,
+                            target_space_id="s", target_folder_id="f",
+                            conflict_strategy="obsidian_wins")
+        media_map = {"attachments/demo.mp4": {
+            "rel_path": "attachments/demo.mp4", "abs_path": self.video,
+            "name": "demo.mp4", "hash": "h1", "file_id": "file_old",
+        }}
+        count = sync_mod._embed_media_blocks(
+            fake, "entry_1", "doc.md", media_map, report, manifest, lambda: None)
+        self.assertEqual(count, 1)
+        self.assertEqual(fake.uploads, [self.video])
+        cached = manifest["attachments"]["doc.md"]["attachments/demo.mp4"]
+        self.assertEqual(cached["file_id"], "file_new")
+
+    def test_plan_embedded_media_collects_without_upload(self):
+        """计划阶段只收集不上传；hash 命中缓存时带上 file_id"""
+        md_path = os.path.join(self.tmpdir, "doc.md")
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write("视频\n\n![[attachments/demo.mp4]]\n\n结束")
+        digest = sync_mod.compute_content_hash(self.video)
+        manifest = {"attachments": {"doc.md": {
+            "attachments/demo.mp4": {"file_id": "file_old", "hash": digest},
+        }}}
+        fi = {"rel_path": "doc.md", "abs_path": md_path}
+        media_map = sync_mod._plan_embedded_media(
+            fi, self.tmpdir, "attachments", manifest, True)
+        info = media_map["attachments/demo.mp4"]
+        self.assertEqual(info["name"], "demo.mp4")
+        self.assertEqual(info["abs_path"], self.video)
+        self.assertEqual(info["hash"], digest)
+        self.assertEqual(info["file_id"], "file_old")
+        # 同一 info 挂在 file_name 键下
+        self.assertIs(media_map["demo.mp4"], info)
+        # 关闭附件同步 → 空
+        self.assertEqual(
+            sync_mod._plan_embedded_media(fi, self.tmpdir, "attachments",
+                                          manifest, False), {})
 
     def test_image_embed_untouched(self):
         out = replace_embedded_media("![[pic.png]]")
