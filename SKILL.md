@@ -172,11 +172,16 @@ stdout 只输出 JSON 摘要和报告路径；进度写 stderr 或 `progress.jso
   对 colab 页 blocks 无效。
   **切换预案**：若服务端白名单补上 video，把 `_create_attachment_block` 建块后追加一步
   `block_update_page replace_blocks`（mdx `<Video file-id name width height align/>`）即可。
-- **VOD 转码全失败 video_content_empty（服务端问题）**：`file_apply_upload` 走 VOD 的视频
-  （mime video/*）100% 转码失败，含全新 ffmpeg 生成的标准 mp4（实测 6/6）。原始文件字节完好、
-  可下载、ffprobe 验证合法——是服务端 VOD 转码/注册问题，客户端无解。即使 Video 块白名单
-  放开，引用 VOD file_id 的块大概率也播不了；块附件 COS 文件（本 skill 现用路径）是否可用于
-  Video 块待白名单放开后验证。
+- **VOD 转码全失败 video_content_empty（服务端问题，与挂载方式强相关）**：
+  `file_apply_upload` 走 VOD 的视频（mime video/*）在 **mount_point=entry** 模式下 100% 转码失败
+  （实测 7/7，含 block_id 绑定模式和全新 ffmpeg 标准 mp4）。原始文件字节完好、可下载、ffprobe
+  验证合法——是服务端 VOD 转码/注册问题，客户端无解。
+  **编辑器插入的视频是 mount_point=page 模式**（2026-10-28 凡哥实测插入 19MB 视频）：
+  `filesystem=vod + mount_point=page + entry_id=页面 + meta.block_id=视频块 + revision_id`，
+  无目录条目、转码正常——但该上传接口未暴露给 OpenAPI/MCP（file_apply_upload 必传
+  parent_entry_id，只能产生 entry 模式；block_id + parent_entry_id 组合虽能通过权限并绑定块，
+  仍是 entry 模式且转码照样失败）。VOD PUT 必须 带 `x-cos-security-token` 头（临时凭证），
+  否则 403。
 - **不要走 `file_apply_upload`/VOD 上传视频用于正文内嵌**（`upload_media`/`_upload_3step`）：
   会在 parent 目录创建 video 条目（视频与文章同级，污染目录），且转码失败见上条。
   `upload_media` 已标记废弃，仅供旧路径兼容。
